@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>CryptoExam — Time-Locked Exam Distribution</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet"/>
+<style>
+:root{
+  --bg:#060810;--surface:#0d1117;--panel:#111823;--border:#1e2d3d;
+  --accent:#00e5ff;--green:#7fff6e;--red:#ff4f8b;--warn:#ffb700;
+  --text:#c9d1d9;--muted:#4a5568;--bright:#ffffff;
+  --mono:'JetBrains Mono',monospace;--sans:'Syne',sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--mono);font-size:13px;line-height:1.6;min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;z-index:0;
+  background-image:linear-gradient(rgba(0,229,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(0,229,255,.025) 1px,transparent 1px);
+  background-size:40px 40px;pointer-events:none}
+#app{position:relative;z-index:1}
+
+/* ── Header ── */
+header{padding:20px 36px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:14px;
+  background:rgba(13,17,23,.93);backdrop-filter:blur(10px);position:sticky;top:0;z-index:100}
+.logo{width:32px;height:32px;border:2px solid var(--accent);border-radius:6px;display:grid;place-items:center;
+  font-size:14px;box-shadow:0 0 14px rgba(0,229,255,.3);flex-shrink:0;animation:glow 3s ease-in-out infinite}
+@keyframes glow{0%,100%{box-shadow:0 0 14px rgba(0,229,255,.3)}50%{box-shadow:0 0 26px rgba(0,229,255,.65)}}
+.logo-text{font-family:var(--sans);font-weight:800;font-size:16px;color:var(--bright)}
+.logo-sub{font-size:10px;color:var(--muted);letter-spacing:.14em;text-transform:uppercase}
+.pill{margin-left:auto;padding:5px 14px;border-radius:999px;font-size:11px;border:1px solid;
+  letter-spacing:.08em;text-transform:uppercase;transition:all .4s;white-space:nowrap}
+.pill.idle{border-color:var(--muted);color:var(--muted);background:rgba(74,85,104,.1)}
+.pill.working{border-color:var(--warn);color:var(--warn);background:rgba(255,183,0,.1);animation:blink 1s step-start infinite}
+.pill.ready{border-color:var(--accent);color:var(--accent);background:rgba(0,229,255,.1)}
+.pill.solving{border-color:var(--accent);color:var(--accent);background:rgba(0,229,255,.1);animation:blink 1s step-start infinite}
+.pill.done{border-color:var(--green);color:var(--green);background:rgba(127,255,110,.1)}
+@keyframes blink{50%{opacity:.45}}
+
+/* ── Layout ── */
+.main{display:grid;grid-template-columns:1fr 1fr;min-height:calc(100vh - 71px)}
+.col{padding:26px 34px;border-right:1px solid var(--border)}
+.col:last-child{border-right:none}
+
+/* ── Section header ── */
+.sec{font-family:var(--sans);font-size:10px;font-weight:600;letter-spacing:.22em;text-transform:uppercase;
+  color:var(--accent);margin-bottom:16px;display:flex;align-items:center;gap:10px}
+.sec::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,var(--accent),transparent)}
+
+/* ── Card ── */
+.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:14px;transition:border-color .3s}
+.card:hover{border-color:rgba(0,229,255,.14)}
+.card-title{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin-bottom:10px}
+
+/* ── Textarea ── */
+textarea{width:100%;background:var(--surface);border:1px solid var(--border);border-radius:6px;
+  color:var(--text);font-family:var(--mono);font-size:12px;padding:11px;resize:vertical;
+  min-height:120px;outline:none;transition:border-color .2s,box-shadow .2s;line-height:1.7}
+textarea:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(0,229,255,.1)}
+
+/* ── Datetime picker ── */
+.dt-wrap{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:12px}
+.dt-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em;margin-bottom:8px;display:flex;align-items:center;gap:8px}
+.dt-label .icon{font-size:13px}
+input[type=datetime-local]{width:100%;background:var(--panel);border:1px solid var(--border);
+  border-radius:5px;color:var(--bright);font-family:var(--mono);font-size:13px;padding:10px 14px;
+  outline:none;transition:border-color .2s;cursor:pointer;color-scheme:dark;letter-spacing:.03em}
+input[type=datetime-local]:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(0,229,255,.1)}
+input[type=datetime-local]::-webkit-calendar-picker-indicator{
+  filter:invert(.45) sepia(1) saturate(2) hue-rotate(170deg);cursor:pointer;padding:2px}
+
+/* ── Countdown ── */
+.countdown-box{margin-top:12px;padding:14px;background:rgba(0,229,255,.03);border:1px solid rgba(0,229,255,.12);
+  border-radius:6px;text-align:center;display:none}
+.countdown-box.show{display:block;animation:fadeUp .4s ease both}
+@keyframes fadeUp{from{opacity:0;transform:translateY(5px)}to{opacity:1}}
+.cd-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.14em;margin-bottom:6px}
+.cd-clock{font-family:var(--sans);font-size:28px;font-weight:800;color:var(--accent);
+  letter-spacing:.06em;text-shadow:0 0 20px rgba(0,229,255,.35)}
+.cd-clock.unlocked{color:var(--green);text-shadow:0 0 20px rgba(127,255,110,.5);animation:glow-green 1s ease-in-out infinite}
+@keyframes glow-green{0%,100%{text-shadow:0 0 20px rgba(127,255,110,.5)}50%{text-shadow:0 0 35px rgba(127,255,110,.85)}}
+.cd-sub{font-size:10px;color:var(--muted);margin-top:5px}
+
+/* ── t info strip ── */
+.t-strip{display:none;margin-top:10px;grid-template-columns:repeat(3,1fr);gap:8px}
+.t-strip.show{display:grid;animation:fadeUp .3s ease both}
+.t-item{background:var(--panel);border:1px solid var(--border);border-radius:5px;padding:8px 10px}
+.t-item-label{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:3px}
+.t-item-val{font-size:12px;font-weight:500}
+.t-item-val.cyan{color:var(--accent)}
+.t-item-val.warn{color:var(--warn)}
+.t-item-val.green{color:var(--green)}
+
+/* ── Buttons ── */
+.btn{display:inline-flex;align-items:center;gap:7px;padding:9px 20px;border-radius:6px;
+  font-family:var(--mono);font-size:11px;font-weight:500;cursor:pointer;border:1px solid;
+  transition:all .2s;letter-spacing:.05em;text-transform:uppercase}
+.btn:disabled{opacity:.35;cursor:not-allowed}
+.btn-primary{background:rgba(0,229,255,.08);border-color:var(--accent);color:var(--accent)}
+.btn-primary:hover:not(:disabled){background:rgba(0,229,255,.16);box-shadow:0 0 16px rgba(0,229,255,.2)}
+.btn-danger{background:rgba(255,79,139,.08);border-color:var(--red);color:var(--red)}
+.btn-danger:hover:not(:disabled){background:rgba(255,79,139,.16)}
+.btn-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+
+/* ── Steps ── */
+.steps{list-style:none}
+.steps li{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-bottom:1px solid rgba(30,45,61,.5)}
+.steps li:last-child{border-bottom:none}
+.snum{width:20px;height:20px;border-radius:50%;border:1px solid var(--border);display:grid;place-items:center;
+  font-size:9px;flex-shrink:0;color:var(--muted);transition:all .35s}
+.snum.done{border-color:var(--green);color:var(--green);background:rgba(127,255,110,.1)}
+.snum.active{border-color:var(--accent);color:var(--accent);background:rgba(0,229,255,.1);animation:blink 1s step-start infinite}
+.snum.erased{border-color:var(--red);color:var(--red);background:rgba(255,79,139,.1)}
+.stitle{font-size:12px;color:var(--bright);margin-bottom:1px}
+.sdetail{font-size:10px;color:var(--muted)}
+
+/* ── Hash boxes ── */
+.hash-label{font-size:10px;color:var(--muted);margin-top:10px;margin-bottom:3px}
+.hash-box{font-size:10px;color:var(--accent);background:rgba(0,229,255,.04);border:1px solid rgba(0,229,255,.12);
+  border-radius:4px;padding:7px 10px;word-break:break-all;line-height:1.5}
+.erasure-banner{background:rgba(255,79,139,.06);border:1px solid rgba(255,79,139,.25);border-radius:6px;
+  padding:9px 13px;font-size:11px;color:var(--red);display:flex;align-items:center;gap:8px;margin-top:10px;
+  animation:fadeUp .5s ease both}
+
+/* ── Solve progress ── */
+.sq-vis{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:11px;
+  font-size:10px;color:var(--muted);min-height:52px;overflow:hidden}
+.sq-line{animation:fadeIn .2s ease;color:var(--accent);opacity:.7}
+@keyframes fadeIn{from{opacity:0;transform:translateX(-3px)}to{opacity:.7}}
+.prog-wrap{background:var(--surface);border:1px solid var(--border);border-radius:4px;height:7px;overflow:hidden;margin:9px 0}
+.prog-bar{height:100%;background:linear-gradient(90deg,var(--accent),#0af);border-radius:4px;
+  transition:width .3s;box-shadow:0 0 10px rgba(0,229,255,.35)}
+.prog-pct{font-size:10px;color:var(--accent);text-align:right}
+
+/* ── Result ── */
+.kv{display:flex;justify-content:space-between;align-items:baseline;padding:5px 0;
+  border-bottom:1px solid rgba(30,45,61,.4);gap:10px}
+.kv:last-child{border-bottom:none}
+.kk{font-size:10px;color:var(--muted);flex-shrink:0}
+.kv-v{font-size:11px;color:var(--text);text-align:right;word-break:break-all}
+.kv-v.green{color:var(--green)}.kv-v.cyan{color:var(--accent)}.kv-v.red{color:var(--red)}
+.exam-out{background:var(--surface);border:1px solid var(--green);border-radius:6px;padding:14px;
+  white-space:pre-wrap;font-size:11px;color:var(--green);line-height:1.8;
+  box-shadow:0 0 20px rgba(127,255,110,.07);animation:fadeUp .5s ease both}
+
+/* ── Audit ── */
+.audit-entry{background:var(--surface);border-left:2px solid var(--border);padding:8px 12px;
+  margin-bottom:7px;border-radius:0 4px 4px 0;transition:border-left-color .3s;animation:fadeUp .3s ease both}
+.audit-entry:hover{border-left-color:var(--accent)}
+.audit-type{font-size:10px;text-transform:uppercase;letter-spacing:.08em}
+.audit-hash{font-size:9px;color:var(--muted);word-break:break-all;margin-top:2px}
+.audit-ts{font-size:9px;color:var(--muted);margin-top:1px}
+.chain-badge{display:inline-flex;align-items:center;gap:6px;padding:4px 11px;border-radius:4px;
+  font-size:10px;margin-bottom:10px;letter-spacing:.08em;text-transform:uppercase}
+.chain-badge.valid{background:rgba(127,255,110,.1);border:1px solid var(--green);color:var(--green)}
+.chain-badge.invalid{background:rgba(255,79,139,.1);border:1px solid var(--red);color:var(--red)}
+
+.hidden{display:none!important}
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+@media(max-width:860px){.main{grid-template-columns:1fr}.col{border-right:none;border-bottom:1px solid var(--border)}.col:last-child{border-bottom:none}}
+</style>
+</head>
+<body>
+<div id="app">
+
+<header>
+  <div class="logo">🔐</div>
+  <div>
+    <div class="logo-text">CryptoExam</div>
+    <div class="logo-sub">RSW Time-Lock · AES-256-GCM · SHA-256 Audit Chain</div>
+  </div>
+  <div id="pill" class="pill idle">● Idle</div>
+</header>
+
+<div class="main">
+
+<!-- ═══════ LEFT: AUTHORITY ═══════ -->
+<div class="col">
+  <div class="sec">① Authority — Encrypt &amp; Lock</div>
+
+  <div class="card">
+    <div class="card-title">Exam Content</div>
+    <textarea id="examText" placeholder="Paste your confidential exam questions here…"></textarea>
+  </div>
+
+  <!-- DATE/TIME PICKER — the only control needed -->
+  <div class="dt-wrap">
+    <div class="dt-label"><span class="icon">⏰</span> Set Unlock Date &amp; Time</div>
+    <input type="datetime-local" id="unlockDt" oninput="onDateChange()"/>
+
+    <!-- Demo mode toggle -->
+    <label style="display:flex;align-items:center;gap:10px;margin-top:12px;cursor:pointer;user-select:none">
+      <div id="demoToggle" onclick="toggleDemo()"
+        style="width:40px;height:22px;border-radius:11px;border:1px solid var(--border);
+               background:var(--surface);position:relative;transition:all .25s;cursor:pointer;flex-shrink:0">
+        <div id="demoKnob"
+          style="position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;
+                 background:var(--muted);transition:all .25s"></div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--text)" id="demoLabel">Demo Mode <span style="color:var(--muted);font-size:10px">— use small t for instant solve</span></div>
+        <div style="font-size:10px;color:var(--muted)" id="demoSub">OFF — t calibrated to real unlock gap</div>
+      </div>
+    </label>
+
+    <!-- auto-computed t info — no button needed -->
+    <div class="t-strip" id="tStrip">
+      <div class="t-item">
+        <div class="t-item-label">Time Until Unlock</div>
+        <div class="t-item-val warn" id="pvGap">–</div>
+      </div>
+      <div class="t-item">
+        <div class="t-item-label">Squarings (t)</div>
+        <div class="t-item-val cyan" id="pvT">–</div>
+      </div>
+      <div class="t-item">
+        <div class="t-item-label">Solve Duration</div>
+        <div class="t-item-val green" id="pvSolve">–</div>
+      </div>
+    </div>
+
+    <!-- Live countdown -->
+    <div class="countdown-box" id="cdBox">
+      <div class="cd-label">Unlocks In</div>
+      <div class="cd-clock" id="cdClock">–</div>
+      <div class="cd-sub" id="cdSub"></div>
+    </div>
+  </div>
+
+  <div class="btn-row">
+    <button class="btn btn-primary" id="btnEncrypt" onclick="runEncrypt()" disabled>
+      🔒 Encrypt &amp; Create Time-Lock
+    </button>
+  </div>
+
+  <!-- Steps -->
+  <div class="card" style="margin-top:14px">
+    <div class="card-title">Workflow</div>
+    <ul class="steps">
+      <li><div class="snum" id="s1">1</div><div><div class="stitle">Generate AES-256-GCM Key</div><div class="sdetail">32 random bytes</div></div></li>
+      <li><div class="snum" id="s2">2</div><div><div class="stitle">Encrypt Exam</div><div class="sdetail">AES-256-GCM + 96-bit nonce</div></div></li>
+      <li><div class="snum" id="s3">3</div><div><div class="stitle">Commit H(exam) + H(K) → Audit Log</div><div class="sdetail" id="sd3">SHA-256 hashes recorded</div></div></li>
+      <li><div class="snum" id="s4">4</div><div><div class="stitle">RSW Time-Lock Puzzle</div><div class="sdetail" id="sd4">t calibrated to unlock datetime</div></div></li>
+      <li><div class="snum" id="s5">5</div><div><div class="stitle">KEY ERASURE</div><div class="sdetail">Key overwritten — server cannot withhold</div></div></li>
+      <li><div class="snum" id="s6">6</div><div><div class="stitle">Distribute to Exam Centers</div><div class="sdetail">Ciphertext + puzzle only — no key</div></div></li>
+    </ul>
+  </div>
+
+  <!-- Commitments -->
+  <div class="card hidden" id="commitCard">
+    <div class="card-title">Published Commitments</div>
+    <div class="hash-label">H(exam plaintext)</div><div class="hash-box" id="dHExam">–</div>
+    <div class="hash-label">H(AES key)</div><div class="hash-box" id="dHKey">–</div>
+    <div class="hash-label">Ciphertext preview</div><div class="hash-box" id="dCipher" style="color:var(--warn)">–</div>
+    <div class="erasure-banner hidden" id="erasureBanner">
+      <span>✖</span><span>Key erased — authority cannot decrypt or withhold.</span>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════ RIGHT: EXAM CENTER + AUDIT ═══════ -->
+<div class="col">
+  <div class="sec">② Exam Center — Solve &amp; Decrypt</div>
+
+  <div class="card">
+    <div class="card-title">Time-Lock Solver</div>
+    <p style="font-size:11px;color:var(--muted);margin-bottom:12px">
+      Solves the puzzle via sequential squaring — no server contact needed after distribute.
+    </p>
+
+    <!-- Countdown mirror -->
+    <div class="countdown-box hidden" id="cdBox2">
+      <div class="cd-label">Puzzle Unlocks In</div>
+      <div class="cd-clock" id="cdClock2">–</div>
+      <div class="cd-sub" id="cdSub2"></div>
+    </div>
+
+    <div class="btn-row" style="margin-top:12px">
+      <button class="btn btn-danger" id="btnSolve" onclick="runSolve()" disabled>
+        🔓 Solve Puzzle
+      </button>
+      <span style="font-size:10px;color:var(--muted);align-self:center" id="solveHint"></span>
+    </div>
+
+    <div class="hidden" id="solveSection" style="margin-top:14px">
+      <div class="sq-vis" id="sqVis"><div style="color:var(--muted)">Initialising…</div></div>
+      <div class="prog-wrap"><div class="prog-bar" id="progBar" style="width:0%"></div></div>
+      <div class="prog-pct" id="progPct">0%</div>
+    </div>
+  </div>
+
+  <div class="card hidden" id="resultCard">
+    <div class="card-title">Verification &amp; Decryption</div>
+    <div id="verifyKvs"></div>
+    <div class="hidden" id="examWrap" style="margin-top:12px">
+      <div style="font-size:10px;color:var(--green);margin-bottom:6px">▼ Decrypted Exam</div>
+      <pre class="exam-out" id="examOut"></pre>
+    </div>
+  </div>
+
+  <div class="sec" style="margin-top:4px">③ Public Audit Log</div>
+  <div class="card">
+    <div id="chainBadge" class="chain-badge valid hidden"><span>✔</span><span>Hash chain verified</span></div>
+    <div id="auditEntries"><div style="font-size:11px;color:var(--muted);padding:8px 0">No entries yet.</div></div>
+    <div class="btn-row" style="margin-top:8px">
+      <button class="btn btn-primary" onclick="loadAudit()" style="font-size:10px;padding:6px 14px">↺ Refresh</button>
+    </div>
+  </div>
+</div>
+
+</div></div>
+
+<script>
+const API = 'http://localhost:5050/api';
+
+let tSquarings   = null;
+let unlockTarget = null;   // Date object
+let cdTimer      = null;
+let solveTimer   = null;
+let visTimer     = null;
+let speedInfo    = '';     // e.g. "20,000 sq/s"
+
+// ── Set default unlock = today + 2 hours ────────────────
+(function(){
+  const d = new Date(); d.setHours(d.getHours()+2); d.setSeconds(0,0);
+  document.getElementById('unlockDt').value =
+    new Date(d - d.getTimezoneOffset()*60000).toISOString().slice(0,16);
+})();
+
+// ── Demo mode ────────────────────────────────────────────
+let DEMO_MODE = false;
+function toggleDemo() {
+  DEMO_MODE = !DEMO_MODE;
+  const knob   = document.getElementById('demoKnob');
+  const toggle = document.getElementById('demoToggle');
+  const sub    = document.getElementById('demoSub');
+  if (DEMO_MODE) {
+    knob.style.left            = '21px';
+    knob.style.background      = 'var(--green)';
+    toggle.style.borderColor   = 'var(--green)';
+    toggle.style.background    = 'rgba(127,255,110,.12)';
+    sub.textContent            = 'ON — t fixed at 5,000 squarings (~instant solve)';
+    sub.style.color            = 'var(--green)';
+  } else {
+    knob.style.left            = '3px';
+    knob.style.background      = 'var(--muted)';
+    toggle.style.borderColor   = 'var(--border)';
+    toggle.style.background    = 'var(--surface)';
+    sub.textContent            = 'OFF — t calibrated to real unlock gap';
+    sub.style.color            = 'var(--muted)';
+  }
+  onDateChange();   // recompute t with new mode
+}
+
+// ── Fetch benchmark from backend on load (silent) ───────
+async function init() {
+  try {
+    const r = await fetch(`${API}/benchmark`);
+    if (!r.ok) { setTimeout(init, 1500); return; }   // retry until backend ready
+    const d = await r.json();
+    speedInfo = `${d.squarings_per_sec.toLocaleString()} squarings/sec`;
+    onDateChange();   // now compute t for the default datetime
+  } catch(e) {
+    setTimeout(init, 1500);   // backend not up yet, keep retrying silently
+  }
+}
+init();
+
+// ── Called every time the datetime input changes ─────────
+async function onDateChange() {
+  const val = document.getElementById('unlockDt').value;
+  if (!val) return;
+
+  const localDt = new Date(val);
+  if (isNaN(localDt)) return;
+
+  try {
+    const r = await fetch(`${API}/compute-t`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ unlock_timestamp: localDt.toISOString(), demo_mode: DEMO_MODE })
+    });
+    if (!r.ok) {
+      const e = await r.json();
+      if (e.error === 'Unlock time must be in the future') {
+        document.getElementById('tStrip').classList.remove('show');
+        document.getElementById('cdBox').classList.remove('show');
+        alert('⚠ Unlock time must be in the future.');
+      }
+      return;
+    }
+    const d = await r.json();
+    tSquarings   = d.t_squarings;
+    unlockTarget = localDt;
+
+    // Update t strip
+    document.getElementById('pvGap').textContent   = d.gap_human;
+    document.getElementById('pvT').textContent     = d.demo_mode
+      ? `5,000  (real: ${d.real_t.toLocaleString()})`
+      : d.t_squarings.toLocaleString();
+    document.getElementById('pvSolve').textContent = fmtDur(d.estimated_solve_s);
+    document.getElementById('tStrip').classList.add('show');
+
+    // Update sub-label with speed
+    const sub = `t = ${d.t_squarings.toLocaleString()}  ·  ${speedInfo}`;
+    document.getElementById('cdSub').textContent  = sub;
+    document.getElementById('cdSub2').textContent = sub;
+
+    // Start countdown
+    document.getElementById('cdBox').classList.add('show');
+    startCountdown(localDt);
+    document.getElementById('btnEncrypt').disabled = false;
+  } catch(e) { /* backend not ready yet */ }
+}
+
+// ── Countdown ────────────────────────────────────────────
+function startCountdown(target) {
+  clearInterval(cdTimer);
+  const tick = () => {
+    const diff = target - new Date();
+    const ids  = ['cdClock','cdClock2'];
+    if (diff <= 0) {
+      ids.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) { el.textContent = '🔓  UNLOCKED'; el.classList.add('unlocked'); }
+      });
+      clearInterval(cdTimer);
+      document.getElementById('btnSolve').disabled = !document.getElementById('btnEncrypt').disabled || STATE_encrypted;
+      if (STATE_encrypted) enableSolve();
+      return;
+    }
+    const h = Math.floor(diff/3600000), m = Math.floor(diff%3600000/60000), s = Math.floor(diff%60000/1000);
+    const str = h > 0 ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+    ids.forEach(id => {
+      const el = document.getElementById(id);
+      if (el) { el.textContent = str; if(diff<30000) el.classList.add('unlocked'); }
+    });
+  };
+  tick(); cdTimer = setInterval(tick, 1000);
+}
+const pad = n => String(n).padStart(2,'0');
+
+let STATE_encrypted = false;
+function enableSolve() {
+  document.getElementById('btnSolve').disabled = false;
+  document.getElementById('solveHint').textContent = 'Unlock time reached — puzzle ready.';
+}
+
+// ── Pill ─────────────────────────────────────────────────
+function setPill(p) {
+  const el = document.getElementById('pill');
+  const m  = {idle:['idle','● Idle'],working:['working','● Working…'],
+               ready:['ready','● Ready'],solving:['solving','● Solving…'],done:['done','● Decrypted ✔']};
+  const [c,l] = m[p]||['idle','● Idle'];
+  el.className='pill '+c; el.textContent=l;
+}
+function setStep(id,state) {
+  const el=document.getElementById(id); if(!el) return;
+  el.className='snum '+state;
+  if(state==='done')   el.textContent='✔';
+  if(state==='erased') el.textContent='✖';
+  if(state==='active') el.textContent=id.replace('s','');
+}
+
+// ── ENCRYPT ──────────────────────────────────────────────
+async function runEncrypt() {
+  const text = document.getElementById('examText').value.trim();
+  if (!text)       { alert('Please enter exam content.'); return; }
+  if (!tSquarings) { alert('Please set an unlock time first.'); return; }
+  document.getElementById('btnEncrypt').disabled = true;
+  setPill('working');
+  [1,2,3,4,5,6].forEach(n=>setStep('s'+n, n===1?'active':String(n)));
+  try {
+    const r = await fetch(`${API}/encrypt`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ exam_text: text, t_squarings: tSquarings })
+    });
+    const d = await r.json();
+    if (d.error) { alert(d.error); document.getElementById('btnEncrypt').disabled=false; return; }
+    setTimeout(()=>setStep('s1','done'),150);
+    setTimeout(()=>setStep('s2','done'),400);
+    setTimeout(()=>{setStep('s3','done'); document.getElementById('sd3').textContent=`H(exam): ${d.H_exam.slice(0,14)}… H(K): ${d.H_key.slice(0,14)}…`;},700);
+    setTimeout(()=>{setStep('s4','done'); document.getElementById('sd4').textContent=`t = ${d.t_squarings.toLocaleString()}  |  ${d.bits}-bit RSA`;},1100);
+    setTimeout(()=>setStep('s5','erased'),1500);
+    setTimeout(()=>setStep('s6','done'),1900);
+    document.getElementById('commitCard').classList.remove('hidden');
+    document.getElementById('dHExam').textContent  = d.H_exam;
+    document.getElementById('dHKey').textContent   = d.H_key;
+    document.getElementById('dCipher').textContent = d.ciphertext_preview+`  (${d.ciphertext_len}B)`;
+    setTimeout(()=>document.getElementById('erasureBanner').classList.remove('hidden'),1600);
+    STATE_encrypted = true;
+    setPill('ready');
+    document.getElementById('btnEncrypt').disabled = false;
+    document.getElementById('cdBox2').classList.remove('hidden');
+    document.getElementById('cdBox2').classList.add('show');
+    // if already past unlock time, enable solve immediately
+    if (unlockTarget && new Date() >= unlockTarget) enableSolve();
+    else document.getElementById('solveHint').textContent = 'Solve button enables at unlock time.';
+    loadAudit();
+  } catch(e) {
+    alert('Backend unreachable. Start backend.py first.');
+    document.getElementById('btnEncrypt').disabled=false; setPill('idle');
+  }
+}
+
+// ── SOLVE ────────────────────────────────────────────────
+function startSqVis(t) {
+  const vis=document.getElementById('sqVis'); vis.innerHTML=''; let n=0;
+  visTimer=setInterval(()=>{
+    if(n>9) vis.removeChild(vis.firstChild);
+    const l=document.createElement('div'); l.className='sq-line';
+    const i=Math.floor(Math.random()*t), f=(Math.random()*1e15|0).toString(16).padStart(12,'0');
+    l.textContent=`x[${String(i).padStart(7,' ')}] = …${f}…`;
+    vis.appendChild(l); n++;
+  },100);
+}
+function stopSqVis() {
+  clearInterval(visTimer);
+  const vis=document.getElementById('sqVis');
+  const l=document.createElement('div'); l.className='sq-line';
+  l.style.color='var(--green)'; l.textContent='✔  Key recovered.';
+  vis.appendChild(l);
+}
+
+async function runSolve() {
+  document.getElementById('btnSolve').disabled=true;
+  document.getElementById('solveSection').classList.remove('hidden');
+  setPill('solving'); startSqVis(tSquarings||3000);
+  try {
+    await fetch(`${API}/solve`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    solveTimer=setInterval(pollProgress,300);
+  } catch(e) { alert('Backend unreachable.'); }
+}
+
+async function pollProgress() {
+  try {
+    const r=await fetch(`${API}/progress`); const d=await r.json();
+    const pct=Math.round(d.progress||0);
+    document.getElementById('progBar').style.width=pct+'%';
+    document.getElementById('progPct').textContent=pct+'%';
+    if(d.status==='done'){clearInterval(solveTimer);stopSqVis();setPill('done');showResult(d);loadAudit();}
+    else if(d.status==='error'){clearInterval(solveTimer);setPill('idle');alert('Solve failed.');}
+  } catch(e){}
+}
+
+function showResult(d) {
+  document.getElementById('resultCard').classList.remove('hidden');
+  document.getElementById('verifyKvs').innerHTML=`
+    <div class="kv"><span class="kk">Recovered key (first 16 hex)</span><span class="kv-v cyan">${(d.recovered_key_hex||'').slice(0,16)}…</span></div>
+    <div class="kv"><span class="kk">Key matches H(K) commitment</span><span class="kv-v ${d.key_verified?'green':'red'}">${d.key_verified?'✔ VERIFIED':'✖ MISMATCH'}</span></div>
+    <div class="kv"><span class="kk">AES-256-GCM auth tag</span><span class="kv-v green">✔ PASSED</span></div>
+    <div class="kv"><span class="kk">Exam integrity H(plaintext)</span><span class="kv-v ${d.exam_verified?'green':'red'}">${d.exam_verified?'✔ MATCHES':'✖ MISMATCH'}</span></div>
+    <div class="kv"><span class="kk">Solve time</span><span class="kv-v cyan">${d.solve_time_s}s</span></div>`;
+  if(d.decrypted_text){
+    document.getElementById('examWrap').classList.remove('hidden');
+    document.getElementById('examOut').textContent=d.decrypted_text;
+  }
+}
+
+async function loadAudit() {
+  try {
+    const r=await fetch(`${API}/audit`); const d=await r.json();
+    const badge=document.getElementById('chainBadge');
+    badge.classList.remove('hidden');
+    badge.className='chain-badge '+(d.chain_valid?'valid':'invalid');
+    badge.innerHTML=d.chain_valid?'<span>✔</span><span>Hash chain verified</span>':'<span>✖</span><span>Chain tampered!</span>';
+    const colors={EXAM_COMMITMENT:'var(--accent)',TIME_LOCK_PUZZLE:'var(--warn)',KEY_ERASURE_DECLARATION:'var(--red)'};
+    document.getElementById('auditEntries').innerHTML=(d.log||[]).map(r=>`
+      <div class="audit-entry">
+        <div class="audit-type" style="color:${colors[r.type]||'var(--text)'}">[${r.seq}] ${r.type}</div>
+        <div class="audit-hash">hash: ${r.hash}  prev: ${r.prev}</div>
+        <div class="audit-ts">${r.ts}</div>
+      </div>`).join('')||'<div style="font-size:11px;color:var(--muted);padding:8px 0">No entries yet.</div>';
+  } catch(e){}
+}
+
+function fmtDur(s) {
+  if(s<1)    return (s*1000).toFixed(0)+'ms';
+  if(s<60)   return s.toFixed(1)+'s';
+  if(s<3600) return Math.floor(s/60)+'m '+(s%60|0)+'s';
+  return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';
+}
+</script>
+</body>
+</html>
