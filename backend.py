@@ -107,7 +107,7 @@ def _run_benchmark():
     p = _gen_prime(256); q = _gen_prime(256)
     n = p * q
     x = secrets.randbelow(n - 2) + 2
-    for _ in range(500): x = (x * x) % n          # warmup
+    for _ in range(500): x = (x * x) % n          
     MEASURE = 3000
     t0 = time.perf_counter()
     for _ in range(MEASURE): x = (x * x) % n
