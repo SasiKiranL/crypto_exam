@@ -14,7 +14,7 @@ Run:  python backend.py
 URL:  http://localhost:5050
 """
 
-import os, json, time, hashlib, secrets, threading, base64, traceback
+import os, json, time, hashlib, secrets, threading, base64, traceback, multiprocessing
 from datetime import datetime, timezone
 from typing import Optional, Tuple, Dict, Any
 from flask import Flask, jsonify, request, make_response, send_file
@@ -64,6 +64,7 @@ app = Flask(__name__)
 EXAMS = {}
 EXAMS_LOCK = threading.Lock()
 DEFAULT_EXAM_VDF_BITS = 1024
+ENCRYPT_WORKER_TIMEOUT_S = 60
 
 # Measured once at startup
 SQUARING_TIME_S = None
@@ -109,6 +110,60 @@ def _require_pietrzak_t(t: int):
 
 def _make_exam_id() -> str:
     return f"EXAM-{secrets.token_hex(8).upper()}"
+
+
+def _encrypt_exam_worker(raw_bytes: bytes, t: int, bits: int, scheme: str, conn):
+    """
+    Perform key generation, encryption, and puzzle creation inside a short-lived
+    worker process so the AES key never exists in the Flask process.
+    """
+    try:
+        key = secrets.token_bytes(32)
+        nonce, ciphertext = aes_encrypt(raw_bytes, key)
+        puzzle = generate_vdf_puzzle_with_trapdoor(key, t, bits)
+        puzzle["scheme"] = scheme
+        conn.send({
+            "nonce_hex": nonce.hex(),
+            "ciphertext_hex": ciphertext.hex(),
+            "H_exam": hashlib.sha256(raw_bytes).hexdigest(),
+            "H_key": hashlib.sha256(key).hexdigest(),
+            "puzzle": puzzle,
+        })
+    except Exception as exc:
+        conn.send({"error": str(exc)})
+    finally:
+        conn.close()
+
+
+def _encrypt_exam_in_worker(raw_bytes: bytes, t: int, bits: int, scheme: str) -> dict:
+    ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(
+        target=_encrypt_exam_worker,
+        args=(raw_bytes, t, bits, scheme, child_conn),
+        daemon=False,
+    )
+    proc.start()
+    child_conn.close()
+
+    try:
+        if not parent_conn.poll(ENCRYPT_WORKER_TIMEOUT_S):
+            proc.terminate()
+            proc.join(timeout=5)
+            raise TimeoutError("Encryption worker timed out")
+        result = parent_conn.recv()
+    finally:
+        parent_conn.close()
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+
+    if proc.exitcode not in (0, None) and "error" not in result:
+        raise RuntimeError(f"Encryption worker exited with code {proc.exitcode}")
+    if "error" in result:
+        raise RuntimeError(result["error"])
+    return result
 
 
 def _build_exam_record(
@@ -388,34 +443,35 @@ def api_encrypt():
     audit_log = AuditLog()
     exam_id = _make_exam_id()
     access_token = secrets.token_hex(32)
-    key = secrets.token_bytes(32)
-    nonce, ct = aes_encrypt(raw_bytes, key)
-    H_exam = hashlib.sha256(raw_bytes).hexdigest()
-    H_key = hashlib.sha256(key).hexdigest()
+    try:
+        worker_result = _encrypt_exam_in_worker(raw_bytes, t, bits, scheme)
+    except Exception as exc:
+        return jsonify({"error": f"Encryption worker failed: {exc}"}), 500
+
+    nonce_hex = worker_result["nonce_hex"]
+    ciphertext_hex = worker_result["ciphertext_hex"]
+    H_exam = worker_result["H_exam"]
+    H_key = worker_result["H_key"]
+    puzzle = worker_result["puzzle"]
 
     audit_log.append({"type": "EXAM_COMMITMENT", "exam_id": exam_id,
                       "H_exam": H_exam, "H_key": H_key,
-                      "nonce_hex": nonce.hex(), "mime_type": mime_type, "filename": filename})
-
-    puzzle = generate_vdf_puzzle_with_trapdoor(key, t, bits)
-    puzzle["scheme"] = scheme
+                      "nonce_hex": nonce_hex, "mime_type": mime_type, "filename": filename})
 
     audit_log.append({"type": "VDF_PUZZLE", "exam_id": exam_id,
                       "N_hex": puzzle["N"], "g_hex": puzzle["g"],
                       "t": t, "locked_key": puzzle["locked_key"],
                       "bits": bits, "scheme": scheme})
-    key = b"\x00" * 32
-    del key
     audit_log.append({"type": "KEY_ERASURE_DECLARATION", "exam_id": exam_id,
-                      "mode": "best_effort_logical_erasure",
+                      "mode": "ephemeral_worker_process_terminated",
                       "ts": datetime.now(timezone.utc).isoformat()})
 
     exam_record = _build_exam_record(
         exam_id=exam_id,
         access_token=access_token,
         audit_log=audit_log,
-        nonce=nonce,
-        ciphertext=ct,
+        nonce=bytes.fromhex(nonce_hex),
+        ciphertext=bytes.fromhex(ciphertext_hex),
         puzzle=puzzle,
         h_exam=H_exam,
         h_key=H_key,
@@ -427,9 +483,9 @@ def api_encrypt():
     return jsonify({
         "exam_id": exam_id, "H_exam": H_exam, "H_key": H_key,
         "access_token": access_token,
-        "nonce_hex": nonce.hex(),
-        "ciphertext_preview": ct.hex()[:48] + "…",
-        "ciphertext_len": len(ct), "t_squarings": t,
+        "nonce_hex": nonce_hex,
+        "ciphertext_preview": ciphertext_hex[:48] + "…",
+        "ciphertext_len": len(ciphertext_hex) // 2, "t_squarings": t,
         "bits": bits, "scheme": scheme,
         "mime_type": mime_type, "filename": filename,
         "content_label": content_label,

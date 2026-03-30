@@ -65,7 +65,7 @@ xdg-open frontend.html
 1. Type your exam questions in the text area
 2. Set the unlock date/time — the UI computes the squaring count automatically
 3. Click **⚡ Encrypt & Lock** — watch all 6 workflow steps complete
-4. The erasure banner records best-effort logical erasure of the in-process key reference
+4. The banner records termination of the short-lived encryption worker that held the AES key
 
 ### Exam Center Panel (right)
 
@@ -99,7 +99,7 @@ For a real exam (e.g. "unlock 30 min before exam"), benchmark one squaring on yo
 ## 🔒 Security Model
 
 ```bash
-              LOGICAL KEY ERASURE HERE
+             WORKER PROCESS ENDS HERE
                           ↓
 [Authority]  →  Encrypt  →  Build Puzzle  →  Delete K  →  Distribute
                                                             ↓
@@ -111,7 +111,7 @@ For a real exam (e.g. "unlock 30 min before exam"), benchmark one squaring on yo
 
 **Withholding is defeated because:**
 
-1. The server drops its working key reference after building the puzzle and records that event in the audit log
+1. The main server delegates key handling to a short-lived worker process and records when that worker terminates
 2. Any exam center can independently recover K after t squarings
 3. H(K) in the audit log proves the recovered key is the correct one
 
