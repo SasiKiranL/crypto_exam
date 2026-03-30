@@ -16,6 +16,7 @@ URL:  http://localhost:5050
 
 import os, json, time, hashlib, secrets, threading, base64
 from datetime import datetime, timezone
+from typing import Any, Dict
 from flask import Flask, jsonify, request, make_response, send_file
 import io
 
@@ -405,21 +406,38 @@ def api_verify_vdf():
     Public verifiability endpoint — anyone can verify a VDF output in O(log t).
     Accepts both Wesolowski and Pietrzak proofs.
     """
-    data = request.json or {}
+    data: Dict[str, Any] = request.json or {}
     try:
-        N = int(str(data.get("N")), 16)
-        g = int(str(data.get("g")), 16)
-        y = int(str(data.get("y")), 16)
-        t = int(str(data.get("t")))
+        N_val = data.get("N")
+        g_val = data.get("g")
+        y_val = data.get("y")
+        t_val = data.get("t")
+
+        if N_val is None or g_val is None or y_val is None or t_val is None:
+            return jsonify({"error": "N, g, y, t are required"}), 400
+
+        N = int(str(N_val), 16)
+        g = int(str(g_val), 16)
+        y = int(str(y_val), 16)
+        t = int(str(t_val))
         scheme = data.get("scheme", "wesolowski")
         pi_raw = data.get("pi")
 
         if scheme == "wesolowski":
-            if isinstance(pi_raw, list) and pi_raw and "pi" in pi_raw[0]:
+            if (
+                isinstance(pi_raw, list)
+                and pi_raw
+                and isinstance(pi_raw[0], dict)
+                and "pi" in pi_raw[0]
+            ):
                 pi = int(pi_raw[0]["pi"], 16)
             else:
+                if pi_raw is None:
+                    return jsonify({"error": "pi is required for wesolowski"}), 400
                 pi = int(str(pi_raw), 16)
         elif scheme == "pietrzak":
+            if not isinstance(pi_raw, list):
+                return jsonify({"error": "pi must be a list for pietrzak"}), 400
             pi = [(int(e["mu"], 16), int(e["t"])) for e in pi_raw]
         else:
             return jsonify({"error": f"Unknown scheme: {scheme}"}), 400
