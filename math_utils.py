@@ -22,7 +22,7 @@ def _miller_rabin(n: int, rounds: int = 20) -> bool:
     """Deterministic-quality Miller-Rabin primality test."""
     if n < 2:
         return False
-    if n == 2:
+    if n in (2, 3):
         return True
     if n % 2 == 0:
         return False

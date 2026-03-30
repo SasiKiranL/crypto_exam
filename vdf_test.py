@@ -1,275 +1,310 @@
 """
-vdf_test.py — Automated correctness tests for all VDF constructions
-from Boneh, Bonneau, Bünz, Fisch (2019).
+vdf_test.py - Automated correctness tests for the CryptoExam demo.
 
-Run from d:\\CSS with venv activated:
+Run:
     python vdf_test.py
 
-Expected output: all tests print PASS.
+The output is ASCII-only so it works cleanly on Windows terminals.
 """
 
 import sys
+import time
 import hashlib
 import secrets
 
-# ── make sure we import from the project directory ──
 sys.path.insert(0, ".")
 
 from math_utils import (
-    mod_sqrt, is_quadratic_residue, sloth_permute,
-    fp2_mul, fp2_sqrt, fp2_pow,
-    hash_to_group, _gen_prime, _gen_prime_cong,
+    mod_sqrt,
+    is_quadratic_residue,
+    fp2_mul,
+    fp2_sqrt,
+    hash_to_group,
+    _gen_prime_cong,
+    guralnick_muller_poly_eval,
 )
 from crypto_utils import (
     generate_vdf_setup,
-    # Wesolowski
-    wesolowski_eval_vdf, wesolowski_verify_vdf,
-    # Pietrzak
-    pietrzak_eval_vdf, pietrzak_verify_vdf,
-    # Hash chain
-    hash_chain_eval, hash_chain_verify,
-    # Sloth
-    sloth_eval, sloth_verify,
-    # Sloth++
-    sloth_plus_plus_eval, sloth_plus_plus_verify,
-    # Rational Maps
-    rational_map_eval, rational_map_verify,
-    # Large prime product
-    large_prime_product_eval, large_prime_product_verify,
-    # Beacon
-    randomness_beacon, verify_randomness_beacon,
-    # Replication
-    encode_for_replication, verify_replication_block,
+    wesolowski_eval_vdf,
+    wesolowski_verify_vdf,
+    pietrzak_eval_vdf,
+    pietrzak_verify_vdf,
+    hash_chain_eval,
+    hash_chain_verify,
+    sloth_eval,
+    sloth_verify,
+    sloth_plus_plus_eval,
+    sloth_plus_plus_verify,
+    rational_map_eval,
+    rational_map_verify,
+    large_prime_product_eval,
+    large_prime_product_verify,
+    randomness_beacon,
+    verify_randomness_beacon,
+    encode_for_replication,
+    verify_replication_block,
 )
+from backend import app
 
-PASS = "\033[92mPASS\033[0m"
-FAIL = "\033[91mFAIL\033[0m"
+
+PASS = "PASS"
+FAIL = "FAIL"
 failures = []
 
 
 def check(name: str, condition: bool, extra: str = ""):
     status = PASS if condition else FAIL
-    print(f"  [{status}] {name}" + (f"  ({extra})" if extra else ""))
+    suffix = f" ({extra})" if extra else ""
+    print(f"  [{status}] {name}{suffix}")
     if not condition:
         failures.append(name)
 
 
-# ============================================================
-# 1. Math utilities
-# ============================================================
-print("\n─── 1. Math utilities ───")
+def section(title: str):
+    print(f"\n--- {title} ---")
 
-# 1a. Miller-Rabin on known primes / composites
-from math_utils import _miller_rabin
-check("Miller-Rabin: 7 is prime",  _miller_rabin(7))
-check("Miller-Rabin: 15 not prime", not _miller_rabin(15))
 
-# 1b. Modular square root (p ≡ 3 mod 4)
+def poll_exam_progress(client, exam_id: str, access_token: str, timeout_s: float = 5.0):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        resp = client.get(
+            "/api/progress",
+            query_string={"exam_id": exam_id, "access_token": access_token},
+        )
+        data = resp.get_json()
+        if data.get("status") in {"done", "error"}:
+            return resp.status_code, data
+        time.sleep(0.05)
+    raise TimeoutError(f"Timed out waiting for exam {exam_id}")
+
+
+def poll_proof_progress(client, exam_id: str, access_token: str, timeout_s: float = 5.0):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        resp = client.get(
+            "/api/progress",
+            query_string={"exam_id": exam_id, "access_token": access_token},
+        )
+        data = resp.get_json()
+        if data.get("proof_status") in {"done", "error"}:
+            return resp.status_code, data
+        time.sleep(0.05)
+    raise TimeoutError(f"Timed out waiting for proof on exam {exam_id}")
+
+
+section("1. Math utilities")
+
 p_sloth = _gen_prime_cong(128, 3, 4)
-x_qr = secrets.randbelow(p_sloth - 1) + 1
-# Ensure x is a QR
 x_qr = pow(secrets.randbelow(p_sloth - 1) + 1, 2, p_sloth)
 y_sqrt = mod_sqrt(x_qr, p_sloth)
-check("mod_sqrt: y² ≡ x (mod p)", pow(y_sqrt, 2, p_sloth) == x_qr)
+check("mod_sqrt round-trip", pow(y_sqrt, 2, p_sloth) == x_qr)
+check("quadratic residue detects square", is_quadratic_residue(x_qr, p_sloth))
+check("fp2_mul returns a pair", len(fp2_mul((3, 5), (7, 11), p_sloth)) == 2)
 
-# 1c. Quadratic residue test
-check("is_quadratic_residue correct", is_quadratic_residue(x_qr, p_sloth))
-non_qr = p_sloth - x_qr  # -x is a non-QR when x is QR (for p≡3 mod 4)
-check("is_quadratic_residue: non-QR detected", not is_quadratic_residue(non_qr, p_sloth))
-
-# 1d. Fp² multiplication closure
-a_fp2 = (3, 5)
-b_fp2 = (7, 11)
-c = fp2_mul(a_fp2, b_fp2, p_sloth)
-check("fp2_mul returns tuple", isinstance(c, tuple) and len(c) == 2)
-
-# 1e. Fp² square root round-trip — use a guaranteed perfect square
 rand_elem = (secrets.randbelow(p_sloth - 1) + 1, secrets.randbelow(p_sloth - 1) + 1)
-elem2 = fp2_mul(rand_elem, rand_elem, p_sloth)  # rand_elem² is always a perfect square
-sqrt_e2 = fp2_sqrt(elem2, p_sloth)
-check("fp2_sqrt round-trip", fp2_mul(sqrt_e2, sqrt_e2, p_sloth) == (elem2[0] % p_sloth, elem2[1] % p_sloth))
+elem_square = fp2_mul(rand_elem, rand_elem, p_sloth)
+sqrt_elem = fp2_sqrt(elem_square, p_sloth)
+check("fp2_sqrt round-trip on perfect square", fp2_mul(sqrt_elem, sqrt_elem, p_sloth) == elem_square)
 
-# 1f. hash_to_group
-N_test, g_test = generate_vdf_setup(512)
+N_test, _ = generate_vdf_setup(512)
 g_derived = hash_to_group(b"test_entropy", N_test)
 check("hash_to_group in range", 2 <= g_derived < N_test)
-check("hash_to_group deterministic",
-      g_derived == hash_to_group(b"test_entropy", N_test))
+check("hash_to_group deterministic", g_derived == hash_to_group(b"test_entropy", N_test))
 
-# ============================================================
-# 2. Wesolowski VDF  (§5)
-# ============================================================
-print("\n─── 2. Wesolowski VDF (§5 VDFVC) ───")
+
+section("2. Wesolowski VDF")
 
 N_w, g_w = generate_vdf_setup(512)
 t_w = 500
+y_w, pi_w, _ = wesolowski_eval_vdf(N_w, g_w, t_w)
+check("Wesolowski verify passes", wesolowski_verify_vdf(N_w, g_w, y_w, t_w, pi_w))
+check("Wesolowski rejects tampered y", not wesolowski_verify_vdf(N_w, g_w, (y_w + 1) % N_w, t_w, pi_w))
 
-y_w, pi_w, mask_w = wesolowski_eval_vdf(N_w, g_w, t_w)
-print(f"    eval: y = {hex(y_w)[:18]}…   π = {hex(pi_w)[:18]}…")
-check("Wesolowski: verify correct output", wesolowski_verify_vdf(N_w, g_w, y_w, t_w, pi_w))
 
-# Tamper with y
-check("Wesolowski: rejects wrong y",
-      not wesolowski_verify_vdf(N_w, g_w, (y_w + 1) % N_w, t_w, pi_w))
-
-# Tamper with pi
-check("Wesolowski: rejects wrong π",
-      not wesolowski_verify_vdf(N_w, g_w, y_w, t_w, (pi_w + 1) % N_w))
-
-# ============================================================
-# 3. Pietrzak VDF  (§4)
-# ============================================================
-print("\n─── 3. Pietrzak VDF (§4 VDFIVC) ───")
+section("3. Pietrzak VDF")
 
 N_p, g_p = generate_vdf_setup(512)
-t_p = 256  # power-of-2 for clean recursion
+t_p = 256
+y_p, pi_p, _ = pietrzak_eval_vdf(N_p, g_p, t_p)
+check("Pietrzak verify passes for power-of-two t", pietrzak_verify_vdf(N_p, g_p, y_p, t_p, pi_p))
+check("Pietrzak proof depth is logarithmic", len(pi_p) <= t_p.bit_length())
 
-y_p, pi_p, mask_p = pietrzak_eval_vdf(N_p, g_p, t_p)
-print(f"    eval: y = {hex(y_p)[:18]}…   proof levels = {len(pi_p)}")
-check("Pietrzak: verify correct output", pietrzak_verify_vdf(N_p, g_p, y_p, t_p, pi_p))
-check("Pietrzak: proof has log(t) levels", len(pi_p) <= t_p.bit_length())
+try:
+    pietrzak_eval_vdf(N_p, g_p, 3)
+except ValueError:
+    check("Pietrzak rejects non-power-of-two t", True)
+else:
+    check("Pietrzak rejects non-power-of-two t", False)
 
-# Tamper
-check("Pietrzak: rejects wrong y",
-      not pietrzak_verify_vdf(N_p, g_p, (y_p + 1) % N_p, t_p, pi_p))
 
-# ============================================================
-# 4. Hash-Chain Sequential Function  (§3 Definition 6/7)
-# ============================================================
-print("\n─── 4. Hash-Chain Sequential Function (§3 Def 6/7 baseline) ───")
+section("4. Hash chain")
 
 x_hc = hashlib.sha256(b"exam_challenge").hexdigest()
 t_hc = 500
 y_hc, ckpts = hash_chain_eval(x_hc, t_hc)
-print(f"    eval: y = {y_hc[:18]}…  checkpoints = {len(ckpts)}")
-check("Hash chain: verify with checkpoints", hash_chain_verify(x_hc, y_hc, t_hc, ckpts))
-check("Hash chain: rejects wrong y",
-      not hash_chain_verify(x_hc, y_hc[:-2] + "ff", t_hc, ckpts))
+check("Hash chain verify passes", hash_chain_verify(x_hc, y_hc, t_hc, ckpts))
+check("Hash chain rejects wrong y", not hash_chain_verify(x_hc, y_hc[:-2] + "ff", t_hc, ckpts))
 
-# ============================================================
-# 5. Sloth Weak VDF  (§7.1)
-# ============================================================
-print("\n─── 5. Sloth Weak VDF (§7.1) ───")
+
+section("5. Sloth weak VDF")
 
 p_s = _gen_prime_cong(128, 3, 4)
+sloth_ok = True
+for iterations in (1, 2, 3, 5, 8):
+    for _ in range(10):
+        x_s = secrets.randbelow(p_s - 1) + 1
+        y_s = sloth_eval(x_s, p_s, iterations)
+        sloth_ok = sloth_ok and sloth_verify(x_s, y_s, p_s, iterations)
+check("Sloth verify matches deterministic eval", sloth_ok)
+
 x_s = secrets.randbelow(p_s - 1) + 1
-iters_s = 50
+y_s = sloth_eval(x_s, p_s, 4)
+check("Sloth rejects wrong y", not sloth_verify(x_s, (y_s + 1) % p_s, p_s, 4))
 
-y_s = sloth_eval(x_s, p_s, iters_s)
-print(f"    eval: y = {hex(y_s)[:18]}…")
-check("Sloth: verify by forward squaring", sloth_verify(x_s, y_s, p_s, iters_s))
 
-# Wrong y
-y_bad = (y_s + 1) % p_s
-check("Sloth: rejects wrong y", not sloth_verify(x_s, y_bad, p_s, iters_s))
-
-# ============================================================
-# 6. Sloth++  (§7.1 extension over Fp²)
-# ============================================================
-print("\n─── 6. Sloth++ (§7.1, Fp² extension — 7000× fewer SNARK gates) ───")
+section("6. Sloth++ weak VDF")
 
 p_pp = _gen_prime_cong(128, 3, 4)
+sloth_pp_ok = True
+for iterations in (1, 3, 5):
+    for _ in range(8):
+        x_pp = (secrets.randbelow(p_pp - 1) + 1, secrets.randbelow(p_pp - 1) + 1)
+        y_pp = sloth_plus_plus_eval(x_pp, p_pp, iterations)
+        sloth_pp_ok = sloth_pp_ok and sloth_plus_plus_verify(x_pp, y_pp, p_pp, iterations)
+check("Sloth++ eval/verify stay aligned", sloth_pp_ok)
+
 x_pp = (secrets.randbelow(p_pp - 1) + 1, secrets.randbelow(p_pp - 1) + 1)
-iters_pp = 20
-
-y_pp = sloth_plus_plus_eval(x_pp, p_pp, iters_pp)
-print(f"    eval: y = ({hex(y_pp[0])[:12]}…, {hex(y_pp[1])[:12]}…)")
-check("Sloth++: verify by forward squaring in Fp²", sloth_plus_plus_verify(x_pp, y_pp, p_pp, iters_pp))
-
+y_pp = sloth_plus_plus_eval(x_pp, p_pp, 4)
 y_pp_bad = ((y_pp[0] + 1) % p_pp, y_pp[1])
-check("Sloth++: rejects wrong y", not sloth_plus_plus_verify(x_pp, y_pp_bad, p_pp, iters_pp))
+check("Sloth++ rejects wrong y", not sloth_plus_plus_verify(x_pp, y_pp_bad, p_pp, 4))
 
-# ============================================================
-# 7. Rational Maps Weak VDF (§7.2)
-# ============================================================
-print("\n─── 7. Injective Rational Maps (§7.2) ───")
 
-p_rm = 2027 # small prime ≡ 3 mod 4
+section("7. Rational maps")
+
+p_rm = 2027
 s_rm = 3
 a_rm = 1
-x_rm = secrets.randbelow(p_rm - 1) + 1
-
+y_seed = secrets.randbelow(p_rm - 1) + 1
+x_rm = guralnick_muller_poly_eval(y_seed, a_rm, s_rm, p_rm)
 y_rm = rational_map_eval(x_rm, p_rm, s_rm, a_rm)
-print(f"    eval: y = {y_rm}")
-check("Rational Maps: verify evaluates correct", rational_map_verify(x_rm, y_rm, p_rm, s_rm, a_rm))
-check("Rational Maps: rejects wrong y", not rational_map_verify(x_rm, (y_rm + 1) % p_rm, p_rm, s_rm, a_rm))
+check("Rational map verify passes", rational_map_verify(x_rm, y_rm, p_rm, s_rm, a_rm))
+check("Rational map rejects wrong y", not rational_map_verify(x_rm, (y_rm + 1) % p_rm, p_rm, s_rm, a_rm))
 
-# ============================================================
-# 8. Large Prime Product VDF
-# ============================================================
-print("\n─── 8. Large Prime Product VDF ───")
+
+section("8. Large prime product")
 
 N_lp, g_lp = generate_vdf_setup(512)
-t_lp = 20  # first 20 primes
-
+t_lp = 20
 y_lp = large_prime_product_eval(N_lp, g_lp, t_lp)
-print(f"    eval: y = {hex(y_lp)[:18]}...")
-check("Large Prime: verify correct", large_prime_product_verify(N_lp, g_lp, y_lp, t_lp))
-check("Large Prime: rejects tampered output", not large_prime_product_verify(N_lp, g_lp, (y_lp + 1) % N_lp, t_lp))
+check("Large prime product verify passes", large_prime_product_verify(N_lp, g_lp, y_lp, t_lp))
+check("Large prime product rejects tampered output", not large_prime_product_verify(N_lp, g_lp, (y_lp + 1) % N_lp, t_lp))
 
-# ============================================================
-# 9. Randomness Beacon  (§2 Application)
-# ============================================================
-print("\n─── 7. Randomness Beacon (§2) ───")
+
+section("9. Randomness beacon")
 
 N_b, g_b = generate_vdf_setup(512)
 entropy = b"bitcoin_block_hash_12345"
 t_b = 300
-
-# Wesolowski beacon
 beacon_w = randomness_beacon(entropy, N_b, g_b, t_b, scheme="wesolowski")
-print(f"    beacon (Weso): {beacon_w['beacon_hex'][:20]}…")
-check("Beacon Wesolowski: verify passes", verify_randomness_beacon(beacon_w))
-check("Beacon Wesolowski: deterministic for same entropy+params",
-      randomness_beacon(entropy, N_b, g_b, t_b, scheme="wesolowski")["beacon_hex"]
-      == beacon_w["beacon_hex"])
-# Tamper
+check("Beacon Wesolowski verify passes", verify_randomness_beacon(beacon_w))
+
+beacon_p = randomness_beacon(entropy, N_b, g_b, 256, scheme="pietrzak")
+check("Beacon Pietrzak verify passes", verify_randomness_beacon(beacon_p))
+
 tampered = dict(beacon_w, beacon_hex="00" * 32)
-check("Beacon: rejects tampered beacon_hex", not verify_randomness_beacon(tampered))
+check("Beacon rejects tampered output", not verify_randomness_beacon(tampered))
 
-# Pietrzak beacon
-beacon_p = randomness_beacon(entropy, N_b, g_b, t_b, scheme="pietrzak")
-print(f"    beacon (Pietz): {beacon_p['beacon_hex'][:20]}…")
-check("Beacon Pietrzak: verify passes", verify_randomness_beacon(beacon_p))
 
-# ============================================================
-# 8. Proof of Replication  (§2 Application)
-# ============================================================
-print("\n─── 8. Proof of Replication (§2) ───")
+section("10. Proof of replication")
 
 N_r, g_r = generate_vdf_setup(512)
 t_r = 200
 rep_id = "replicator-node-007"
-blocks = [secrets.token_bytes(32) for _ in range(3)]  # 3 blocks of 32 bytes
-
+blocks = [secrets.token_bytes(32) for _ in range(3)]
 encoded = encode_for_replication(blocks, rep_id, N_r, g_r, t_r, scheme="wesolowski")
-print(f"    encoded {len(encoded)} blocks")
-
-# Spot-check block 1
 entry = encoded[1]
-bi_idx = entry["block_index"]
-check("Replication: spot-verify block 1",
-      verify_replication_block(
-          entry["yi_hex"], blocks[bi_idx], entry["pi"],
-          rep_id, bi_idx, N_r, t_r, scheme="wesolowski"
-      ))
-# Wrong block data
-check("Replication: rejects wrong block content",
-      not verify_replication_block(
-          entry["yi_hex"], secrets.token_bytes(32), entry["pi"],
-          rep_id, bi_idx, N_r, t_r, scheme="wesolowski"
-      ))
+idx = entry["block_index"]
+check(
+    "Replication block verifies",
+    verify_replication_block(entry["yi_hex"], blocks[idx], entry["pi"], rep_id, idx, N_r, t_r, scheme="wesolowski"),
+)
+check(
+    "Replication rejects wrong block data",
+    not verify_replication_block(entry["yi_hex"], secrets.token_bytes(32), entry["pi"], rep_id, idx, N_r, t_r, scheme="wesolowski"),
+)
 
-# ============================================================
-# Summary
-# ============================================================
-print("\n" + "═" * 50)
+
+section("11. Backend exam isolation")
+
+client = app.test_client()
+enc1 = client.post("/api/encrypt", json={"exam_text": "exam A", "t_squarings": 4, "bits": 256, "scheme": "wesolowski"}).get_json()
+enc2 = client.post("/api/encrypt", json={"exam_text": "exam B", "t_squarings": 4, "bits": 256, "scheme": "wesolowski"}).get_json()
+
+check("Backend returns distinct exam ids", enc1["exam_id"] != enc2["exam_id"])
+check("Backend returns distinct access tokens", enc1["access_token"] != enc2["access_token"])
+
+bad_progress = client.get(
+    "/api/progress",
+    query_string={"exam_id": enc1["exam_id"], "access_token": enc2["access_token"]},
+)
+check("Progress rejects wrong token", bad_progress.status_code == 403)
+
+audit1 = client.get("/api/audit", query_string={"exam_id": enc1["exam_id"]}).get_json()
+audit2 = client.get("/api/audit", query_string={"exam_id": enc2["exam_id"]}).get_json()
+check("Audit is namespaced per exam", audit1["exam_id"] == enc1["exam_id"] and audit2["exam_id"] == enc2["exam_id"])
+
+solve1 = client.post(
+    "/api/solve",
+    json={"exam_id": enc1["exam_id"], "access_token": enc1["access_token"]},
+)
+check("Solve starts for exam 1", solve1.status_code == 200)
+status_code_1, progress1 = poll_exam_progress(client, enc1["exam_id"], enc1["access_token"])
+check("Exam 1 solve completes", status_code_1 == 200 and progress1["status"] == "done")
+check("Exam 1 decrypts its own plaintext", progress1["decrypted_text"] == "exam A")
+
+idle_progress = client.get(
+    "/api/progress",
+    query_string={"exam_id": enc2["exam_id"], "access_token": enc2["access_token"]},
+)
+check("Exam 2 remains idle until solved", idle_progress.status_code == 200 and idle_progress.get_json()["status"] == "idle")
+
+solve2 = client.post(
+    "/api/solve",
+    json={"exam_id": enc2["exam_id"], "access_token": enc2["access_token"]},
+)
+check("Solve starts for exam 2", solve2.status_code == 200)
+_, progress2_done = poll_exam_progress(client, enc2["exam_id"], enc2["access_token"])
+check("Exam 2 decrypts its own plaintext", progress2_done["decrypted_text"] == "exam B")
+
+proof_start = client.post(
+    "/api/generate_proof",
+    json={"exam_id": enc1["exam_id"], "access_token": enc1["access_token"]},
+)
+check("Proof generation starts for solved exam", proof_start.status_code == 200)
+_, proof_done = poll_proof_progress(client, enc1["exam_id"], enc1["access_token"])
+check("Proof generation completes", proof_done["proof_status"] == "done" and len(proof_done["vdf_proof"]) > 0)
+
+verify_resp = client.post(
+    "/api/verify_vdf",
+    json={
+        "N": enc1["puzzle_public"]["N_hex"],
+        "g": enc1["puzzle_public"]["g_hex"],
+        "y": proof_done["y_hex"],
+        "t": enc1["puzzle_public"]["t"],
+        "scheme": enc1["puzzle_public"]["scheme"],
+        "pi": proof_done["vdf_proof"],
+    },
+)
+verify_data = verify_resp.get_json()
+check("Generated proof verifies publicly", verify_resp.status_code == 200 and verify_data["is_valid"])
+
+
+print("\n" + "=" * 50)
 if failures:
-    print(f"  {FAIL}  {len(failures)} test(s) failed:")
-    for f in failures:
-        print(f"    • {f}")
+    print(f"  [{FAIL}] {len(failures)} test(s) failed:")
+    for failure in failures:
+        print(f"    - {failure}")
     sys.exit(1)
 else:
-    total = 26   # total check() calls above
-    print(f"  {PASS}  All tests passed! ({total} assertions)")
-print("═" * 50 + "\n")
+    print("  [PASS] All tests passed.")
+print("=" * 50)

@@ -14,7 +14,7 @@ A proof-of-concept implementation of a **withholding-resistant** exam distributi
 | ------ | --------- |
 | `backend.py` | Flask REST API — all cryptographic logic |
 | `frontend.html` | Browser UI — open directly in any browser |
-| `time_locked_exam_system.py` | Original standalone CLI script |
+| `vdf_test.py` | End-to-end regression suite for the demo |
 
 ---
 
@@ -63,9 +63,9 @@ xdg-open frontend.html
 ### Authority Panel (left)
 
 1. Type your exam questions in the text area
-2. Adjust the **squarings slider** — higher = longer delay before key is recoverable
+2. Set the unlock date/time — the UI computes the squaring count automatically
 3. Click **⚡ Encrypt & Lock** — watch all 6 workflow steps complete
-4. The key erasure banner confirms the server no longer holds the key
+4. The erasure banner records best-effort logical erasure of the in-process key reference
 
 ### Exam Center Panel (right)
 
@@ -77,7 +77,7 @@ xdg-open frontend.html
 
 ### Audit Log (bottom right)
 
-- Shows all 3 entries: `EXAM_COMMITMENT` → `TIME_LOCK_PUZZLE` → `KEY_ERASURE_DECLARATION`
+- Shows all 3 entries: `EXAM_COMMITMENT` → `VDF_PUZZLE` → `KEY_ERASURE_DECLARATION`
 - Hash chain integrity badge confirms no tampering
 
 ---
@@ -99,7 +99,7 @@ For a real exam (e.g. "unlock 30 min before exam"), benchmark one squaring on yo
 ## 🔒 Security Model
 
 ```bash
-                    KEY ERASED HERE
+              LOGICAL KEY ERASURE HERE
                           ↓
 [Authority]  →  Encrypt  →  Build Puzzle  →  Delete K  →  Distribute
                                                             ↓
@@ -111,6 +111,12 @@ For a real exam (e.g. "unlock 30 min before exam"), benchmark one squaring on yo
 
 **Withholding is defeated because:**
 
-1. The server erases K — it literally cannot withhold what it doesn't have
+1. The server drops its working key reference after building the puzzle and records that event in the audit log
 2. Any exam center can independently recover K after t squarings
 3. H(K) in the audit log proves the recovered key is the correct one
+
+## ✅ Tests
+
+```bash
+python vdf_test.py
+```
