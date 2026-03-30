@@ -886,11 +886,15 @@ def verify_vdf(N: int, g: int, y: int, t: int, pi, scheme: str = "wesolowski") -
     Unified Verify dispatcher — delegates to the selected VDF scheme.
     """
     if scheme == "wesolowski":
-        if isinstance(pi, str):
-            pi = int(pi, 16)
+        if isinstance(pi, int):
+            normalized_pi = pi
+        elif isinstance(pi, str):
+            normalized_pi = int(pi, 16)
         elif isinstance(pi, list) and len(pi) == 1 and isinstance(pi[0], str):
-            pi = int(pi[0], 16)
-        return wesolowski_verify_vdf(N, g, y, t, pi)
+            normalized_pi = int(pi[0], 16)
+        else:
+            raise ValueError("Invalid Wesolowski proof format")
+        return wesolowski_verify_vdf(N, g, y, t, normalized_pi)
     elif scheme == "pietrzak":
         if isinstance(pi, list) and pi and isinstance(pi[0], dict):
             pi = [(int(e["mu"], 16), int(e["t"])) for e in pi]
