@@ -696,7 +696,7 @@ def verify_randomness_beacon(beacon_dict: dict) -> bool:
 
 def _block_hash(replicator_id: str, block_index: int, block_size: int) -> bytes:
     """H(id || i) — deterministic per-block hash."""
-    data = replicator_id.encode() + b"||" + str(block_index).to_bytes(8, "big")
+    data = replicator_id.encode() + b"||" + block_index.to_bytes(8, "big")
     h = hashlib.sha256(data).digest()
     # Expand to block_size
     while len(h) < block_size:
@@ -828,10 +828,19 @@ def verify_vdf(N: int, g: int, y: int, t: int, pi, scheme: str = "wesolowski") -
     """
     if scheme == "wesolowski":
         if isinstance(pi, str):
-            pi = int(pi, 16)
-        elif isinstance(pi, list) and len(pi) == 1 and isinstance(pi[0], str):
-            pi = int(pi[0], 16)
-        return wesolowski_verify_vdf(N, g, y, t, pi)
+            pi_int = int(pi, 16)
+        elif isinstance(pi, int):
+            pi_int = pi
+        elif isinstance(pi, list):
+            if len(pi) == 1 and isinstance(pi[0], str):
+                pi_int = int(pi[0], 16)
+            elif len(pi) == 1 and isinstance(pi[0], int):
+                pi_int = pi[0]
+            else:
+                raise ValueError("Invalid wesolowski proof format")
+        else:
+            pi_int = int(pi)
+        return wesolowski_verify_vdf(N, g, y, t, pi_int)
     elif scheme == "pietrzak":
         if isinstance(pi, list) and pi and isinstance(pi[0], dict):
             pi = [(int(e["mu"], 16), int(e["t"])) for e in pi]
