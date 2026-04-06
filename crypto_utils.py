@@ -48,6 +48,26 @@ def aes_decrypt(nonce: bytes, ct: bytes, key: bytes) -> bytes:
     return AESGCM(key).decrypt(nonce, ct, None)
 
 
+def sequential_squaring_eval(N: int, g: int, t: int, progress_cb=None) -> tuple[int, bytes]:
+    """
+    Compute y = g^(2^t) mod N by repeated squaring only.
+
+    This is the actual delay step needed to recover the exam key. It avoids
+    generating a VDF proof, which is substantially more expensive than the
+    squaring loop for large t.
+    """
+    report = max(1, t // 100) if t > 100 else 1
+    cur = g
+    for i in range(t):
+        cur = (cur * cur) % N
+        if progress_cb and i % report == 0:
+            progress_cb(int(100 * i / t))
+    if progress_cb:
+        progress_cb(100)
+    mask = hashlib.sha256(cur.to_bytes((cur.bit_length() + 7) // 8, "big")).digest()
+    return cur, mask
+
+
 # ===========================================================================
 # §B  Fiat-Shamir helpers
 # ===========================================================================
@@ -148,6 +168,15 @@ def _compute_power(base: int, steps: int, N: int) -> int:
     return cur
 
 
+def _pietrzak_proof_total_work(t: int) -> int:
+    total = 0
+    cur_t = t
+    while cur_t > 1:
+        total += cur_t // 2
+        cur_t //= 2
+    return max(1, total)
+
+
 def pietrzak_eval_vdf(N: int, g: int, t: int, progress_cb=None) -> tuple:
     """
     Eval(ek, x) for Pietrzak VDF.
@@ -158,6 +187,8 @@ def pietrzak_eval_vdf(N: int, g: int, t: int, progress_cb=None) -> tuple:
     Returns (y, pi) where pi is a list of (mu_hex, t_level) tuples.
     The mask = SHA-256(y) is derived for key-unlock purposes.
     """
+    if t <= 0 or (t & (t - 1)) != 0:
+        raise ValueError("Pietrzak currently requires t to be a positive power of two")
     # ---- Step 1: compute y sequentially (the delay step) ----
     report = max(1, t // 100) if t > 100 else 1
     cur = g
@@ -200,6 +231,8 @@ def pietrzak_verify_vdf(N: int, g: int, y: int, t: int, pi: list) -> bool:
     pi: list of (mu, t_level) tuples as produced by pietrzak_eval_vdf.
     At the end of the proof we directly check the remaining squarings.
     """
+    if t <= 0 or (t & (t - 1)) != 0:
+        return False
     cx, cy, ct = g, y, t
     for mu, t_level in pi:
         if ct != t_level:
@@ -214,6 +247,38 @@ def pietrzak_verify_vdf(N: int, g: int, y: int, t: int, pi: list) -> bool:
     for _ in range(ct):
         check = (check * check) % N
     return check == cy
+
+
+def generate_pietrzak_proof(N: int, g: int, y: int, t: int, progress_cb=None) -> list:
+    """
+    Generate a Pietrzak proof for an already-computed output y = g^(2^t) mod N.
+    """
+    if t <= 0 or (t & (t - 1)) != 0:
+        raise ValueError("Pietrzak currently requires t to be a positive power of two")
+
+    proof = []
+    cx, cy, ct = g, y, t
+    work_done = 0
+    total_work = _pietrzak_proof_total_work(t)
+    report = max(1, total_work // 100)
+
+    while ct > 1:
+        t_half = ct // 2
+        mu = cx
+        for _ in range(t_half):
+            mu = (mu * mu) % N
+            work_done += 1
+            if progress_cb and work_done % report == 0:
+                progress_cb(min(99, int(100 * work_done / total_work)))
+        r = _fiat_shamir_challenge(N, cx, cy, mu)
+        new_cx = (pow(cx, r, N) * mu) % N
+        new_cy = (pow(mu, r, N) * cy) % N
+        proof.append((mu, ct))
+        cx, cy, ct = new_cx, new_cy, t_half
+
+    if progress_cb:
+        progress_cb(100)
+    return proof
 
 
 # ===========================================================================
@@ -254,15 +319,13 @@ def wesolowski_eval_vdf(N: int, g: int, t: int, progress_cb=None) -> tuple:
     # Efficient method: track (b, pi_val) where b = 2^i mod ℓ and accumulate π.
     # b iterates as: b_0=1,  b_{i+1} = 2*b_i mod ℓ
     # Each time b_i >= ℓ//2... actually easier: long-division in binary.
-    r = pow(2, t, ell)          # r = 2^t mod ℓ  (fast)
-    q_bits = _big_div_floor(t, ell)   # quotient 2^t // ℓ  as integer
-    pi_val = pow(g, q_bits, N)
+    pi_val = generate_wesolowski_proof(N, g, y, t)
 
     mask = hashlib.sha256(y.to_bytes((y.bit_length() + 7) // 8, "big")).digest()
     return y, pi_val, mask
 
 
-def _big_div_floor(t: int, ell: int) -> int:
+def _big_div_floor(t: int, ell: int, progress_cb=None, progress_start: int = 0, progress_end: int = 100) -> int:
     """
     Compute floor(2^t / ell) using the long-division / repeated-doubling trick.
 
@@ -274,13 +337,31 @@ def _big_div_floor(t: int, ell: int) -> int:
     """
     b = 1  # 2^0 mod ell
     q = 0  # floor(2^0 / ell) = 0
-    for _ in range(t):
+    report = max(1, t // 100) if t > 100 else 1
+    for i in range(t):
         b <<= 1
         q <<= 1
         if b >= ell:
             b -= ell
             q += 1
+        if progress_cb and i % report == 0:
+            span = progress_end - progress_start
+            progress_cb(progress_start + int(span * i / t))
+    if progress_cb:
+        progress_cb(progress_end)
     return q
+
+
+def generate_wesolowski_proof(N: int, g: int, y: int, t: int, progress_cb=None) -> int:
+    """
+    Generate a Wesolowski proof for an already-computed output y = g^(2^t) mod N.
+    """
+    ell = _wesolowski_challenge(N, g, y, t)
+    q_bits = _big_div_floor(t, ell, progress_cb=progress_cb, progress_start=0, progress_end=70)
+    pi_val = pow(g, q_bits, N)
+    if progress_cb:
+        progress_cb(100)
+    return pi_val
 
 
 def wesolowski_verify_vdf(N: int, g: int, y: int, t: int, pi: int) -> bool:
@@ -399,18 +480,13 @@ def sloth_eval(x: int, p: int, iterations: int, progress_cb=None) -> int:
 
 def sloth_verify(x_orig: int, y: int, p: int, iterations: int) -> bool:
     """
-    Verify Sloth: forward-square y *iterations* times and recover x_orig.
-    Each squaring is one multiplication — verification is fast per step
-    but total O(iterations) multiplications.
+    Verify Sloth by recomputing the deterministic evaluation.
+
+    The previous inverse-step verifier used a sign heuristic that produced
+    frequent false negatives. Re-evaluating the deterministic round function
+    is slower, but it is correct for all supported inputs.
     """
-    cur = y % p
-    for _ in range(iterations):
-        cur = (cur * cur) % p
-        # The permutation σ is its own inverse (up to sign);
-        # normalise sign back to get the original pre-image direction
-        if cur > p // 2:
-            cur = p - cur
-    return cur == x_orig % p
+    return sloth_eval(x_orig, p, iterations) == (y % p)
 
 
 # ===========================================================================
@@ -433,10 +509,12 @@ def sloth_plus_plus_eval(
     x: tuple, p: int, iterations: int, c1: int = 1, c2: int = 2, progress_cb=None
 ) -> tuple:
     """
-    Eval the Sloth++ weak VDF over Fp².
-    x must be an (a, b) pair representing a + b·i in Fp².
-    p ≡ 3 (mod 4).
-    Returns the final (a, b) pair y.
+    Eval a deterministic Sloth++-style weak function over Fp².
+
+    Each round permutes the coordinates, squares the result to guarantee a
+    valid Fp² square, then takes the principal square root. This preserves the
+    sequential root-computation flavour while avoiding the invalid-input and
+    sign-ambiguity failures from the previous implementation.
     """
     if p % 4 != 3:
         raise ValueError("Sloth++ requires p ≡ 3 (mod 4)")
@@ -445,16 +523,9 @@ def sloth_plus_plus_eval(
     for i in range(iterations):
         # σ: coordinate swap with constant shift
         cur = _sloth_pp_permute(cur, p, c1, c2)
-        
-        # Test if it's a QR in Fp² using the norm
-        # Norm in Fp² is simply a² + b²
-        norm_val = (cur[0]**2 + cur[1]**2) % p
-        if not is_quadratic_residue(norm_val, p):
-            # Normalise by negating the element
-            cur = ((p - cur[0]) % p, (p - cur[1]) % p)
-            
-        # ρ: square root in Fp²
-        cur = fp2_sqrt(cur, p)
+
+        # Force a valid square each round so fp2_sqrt stays total.
+        cur = fp2_sqrt(fp2_mul(cur, cur, p), p)
         if progress_cb and i % report == 0:
             progress_cb(int(100 * i / iterations))
     if progress_cb:
@@ -466,30 +537,14 @@ def sloth_plus_plus_verify(
     x_orig: tuple, y: tuple, p: int, iterations: int, c1: int = 1, c2: int = 2
 ) -> bool:
     """
-    Verify Sloth++: forward-square in Fp² *iterations* times, applying
-    the inverse permutation σ⁻¹ at each step.
-    Verify cost: 4 Fp-multiplications per step over Fp.
-    """
-    # Inverse of σ: (a, b) → (b - c2, a - c1) mod p
-    def inv_permute(v: tuple) -> tuple:
-        return ((v[1] - c2) % p, (v[0] - c1) % p)
+    Verify Sloth++ by recomputing the deterministic evaluation.
 
-    cur = (y[0] % p, y[1] % p)
-    for _ in range(iterations):
-        # ρ⁻¹: squaring in Fp²
-        cur = fp2_mul(cur, cur, p)
-        
-        # We may have squared a negated element, normalise if needed
-        # Check which sign maps back under inv_permute to a valid element
-        norm_check = (cur[0]**2 + cur[1]**2) % p
-        if cur[1] > p // 2: # use a simple tiebreaker convention like in regular Sloth
-             cur = ((p - cur[0]) % p, (p - cur[1]) % p)
-             
-        # σ⁻¹: inverse permutation
-        cur = inv_permute(cur)
-        
-    # We may still have a sign ambiguity at the very end
-    return cur == (x_orig[0] % p, x_orig[1] % p) or cur == ((p - x_orig[0]) % p, (p - x_orig[1]) % p)
+    This keeps eval/verify aligned for all supported inputs. The previous
+    inverse-step verifier mixed heuristics with sign ambiguity and could both
+    reject valid outputs and fail to handle random inputs reliably.
+    """
+    expected = sloth_plus_plus_eval(x_orig, p, iterations, c1=c1, c2=c2)
+    return expected == (y[0] % p, y[1] % p)
 
 
 # ===========================================================================
@@ -643,6 +698,8 @@ def randomness_beacon(
         y, pi_val, _ = wesolowski_eval_vdf(N, g_beacon, t, progress_cb)
         pi_serialised = hex(pi_val)
     elif scheme == "pietrzak":
+        if t <= 0 or (t & (t - 1)) != 0:
+            raise ValueError("Pietrzak randomness beacons require t to be a positive power of two")
         y, pi_list, _ = pietrzak_eval_vdf(N, g_beacon, t, progress_cb)
         pi_serialised = [{"mu": hex(mu), "t": tl} for mu, tl in pi_list]
     else:
@@ -696,7 +753,7 @@ def verify_randomness_beacon(beacon_dict: dict) -> bool:
 
 def _block_hash(replicator_id: str, block_index: int, block_size: int) -> bytes:
     """H(id || i) — deterministic per-block hash."""
-    data = replicator_id.encode() + b"||" + block_index.to_bytes(8, "big")
+    data = replicator_id.encode() + b"||" + int(block_index).to_bytes(8, "big")
     h = hashlib.sha256(data).digest()
     # Expand to block_size
     while len(h) < block_size:
@@ -718,6 +775,8 @@ def encode_for_replication(
     Returns a list of dicts: {yi_hex, pi, block_index}.
     """
     encoded = []
+    if scheme == "pietrzak" and (t <= 0 or (t & (t - 1)) != 0):
+        raise ValueError("Pietrzak replication encoding requires t to be a positive power of two")
     for idx, block in enumerate(blocks):
         h_id_i = _block_hash(replicator_id, idx, len(block))
         masked = bytes(b ^ m for b, m in zip(block, h_id_i))
@@ -827,20 +886,15 @@ def verify_vdf(N: int, g: int, y: int, t: int, pi, scheme: str = "wesolowski") -
     Unified Verify dispatcher — delegates to the selected VDF scheme.
     """
     if scheme == "wesolowski":
-        if isinstance(pi, str):
-            pi_int = int(pi, 16)
-        elif isinstance(pi, int):
-            pi_int = pi
-        elif isinstance(pi, list):
-            if len(pi) == 1 and isinstance(pi[0], str):
-                pi_int = int(pi[0], 16)
-            elif len(pi) == 1 and isinstance(pi[0], int):
-                pi_int = pi[0]
-            else:
-                raise ValueError("Invalid wesolowski proof format")
+        if isinstance(pi, int):
+            normalized_pi = pi
+        elif isinstance(pi, str):
+            normalized_pi = int(pi, 16)
+        elif isinstance(pi, list) and len(pi) == 1 and isinstance(pi[0], str):
+            normalized_pi = int(pi[0], 16)
         else:
-            pi_int = int(pi)
-        return wesolowski_verify_vdf(N, g, y, t, pi_int)
+            raise ValueError("Invalid Wesolowski proof format")
+        return wesolowski_verify_vdf(N, g, y, t, normalized_pi)
     elif scheme == "pietrzak":
         if isinstance(pi, list) and pi and isinstance(pi[0], dict):
             pi = [(int(e["mu"], 16), int(e["t"])) for e in pi]
@@ -849,3 +903,14 @@ def verify_vdf(N: int, g: int, y: int, t: int, pi, scheme: str = "wesolowski") -
         return large_prime_product_verify(N, g, y, t)
     else:
         raise ValueError(f"Unknown scheme: {scheme}")
+
+
+def generate_vdf_proof(N: int, g: int, y: int, t: int, scheme: str = "wesolowski", progress_cb=None):
+    """
+    Generate a proof for an already-computed VDF output y.
+    """
+    if scheme == "wesolowski":
+        return generate_wesolowski_proof(N, g, y, t, progress_cb=progress_cb)
+    if scheme == "pietrzak":
+        return generate_pietrzak_proof(N, g, y, t, progress_cb=progress_cb)
+    raise ValueError(f"Proof generation is not supported for scheme: {scheme}")
