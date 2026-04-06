@@ -205,7 +205,7 @@ input[type=datetime-local]::-webkit-calendar-picker-indicator{
   <div class="logo">🔐</div>
   <div>
     <div class="logo-text">CryptoExam VDF</div>
-    <div class="logo-sub">Pietrzak VDF · AES-256-GCM · SHA-256 Audit Chain</div>
+    <div class="logo-sub">Wesolowski VDF · AES-256-GCM · SHA-256 Audit Chain</div>
   </div>
   <div id="pill" class="pill idle">● Idle</div>
 </header>
@@ -313,8 +313,8 @@ input[type=datetime-local]::-webkit-calendar-picker-indicator{
       <li><div class="snum" id="s1">1</div><div><div class="stitle">Generate AES-256-GCM Key</div><div class="sdetail">32 random bytes</div></div></li>
       <li><div class="snum" id="s2">2</div><div><div class="stitle">Encrypt Exam</div><div class="sdetail">AES-256-GCM + 96-bit nonce</div></div></li>
       <li><div class="snum" id="s3">3</div><div><div class="stitle">Commit H(exam) + H(K) → Audit Log</div><div class="sdetail" id="sd3">SHA-256 hashes recorded</div></div></li>
-      <li><div class="snum" id="s4">4</div><div><div class="stitle">VDF Puzzle (Pietrzak)</div><div class="sdetail" id="sd4">t calibrated to unlock datetime</div></div></li>
-      <li><div class="snum" id="s5">5</div><div><div class="stitle">KEY ERASURE</div><div class="sdetail">Key overwritten — server cannot withhold</div></div></li>
+      <li><div class="snum" id="s4">4</div><div><div class="stitle">VDF Puzzle</div><div class="sdetail" id="sd4">t calibrated to unlock datetime</div></div></li>
+      <li><div class="snum" id="s5">5</div><div><div class="stitle">KEY LIFECYCLE END</div><div class="sdetail">Ephemeral encryption worker exits after returning ciphertext and puzzle data</div></div></li>
       <li><div class="snum" id="s6">6</div><div><div class="stitle">Distribute to Exam Centers</div><div class="sdetail">Ciphertext + puzzle only — no key</div></div></li>
     </ul>
   </div>
@@ -326,7 +326,7 @@ input[type=datetime-local]::-webkit-calendar-picker-indicator{
     <div class="hash-label">H(AES key)</div><div class="hash-box" id="dHKey">–</div>
     <div class="hash-label">Ciphertext preview</div><div class="hash-box" id="dCipher" style="color:var(--warn)">–</div>
     <div class="erasure-banner hidden" id="erasureBanner">
-      <span>✖</span><span>Key erased — authority cannot decrypt or withhold.</span>
+      <span>✖</span><span>Worker process terminated — the AES key only existed inside the short-lived encryption worker.</span>
     </div>
   </div>
 </div>
@@ -351,6 +351,9 @@ input[type=datetime-local]::-webkit-calendar-picker-indicator{
     <div class="btn-row" style="margin-top:12px">
       <button class="btn btn-danger" id="btnSolve" onclick="runSolve()" disabled>
         🔓 Evaluate VDF
+      </button>
+      <button class="btn btn-primary hidden" id="btnGenerateProof" onclick="runGenerateProof()" disabled>
+        🧮 Generate Proof
       </button>
       <button class="btn btn-primary hidden" id="btnVerify" onclick="runVerify()" disabled style="margin-left:auto">
         ⚡ Verify Proof instantly
@@ -403,6 +406,9 @@ let cdTimer      = null;
 let solveTimer   = null;
 let visTimer     = null;
 let speedInfo    = '';     // e.g. "20,000 sq/s"
+let CURRENT_EXAM_ID = null;
+let CURRENT_ACCESS_TOKEN = null;
+let CURRENT_PUZZLE = null;
 
 // ── Upload state ────────────────────────────────────────────
 let ACTIVE_TAB   = 'text';   // 'text' | 'pdf' | 'image'
@@ -513,7 +519,7 @@ async function init() {
     const r = await fetch(`${API}/benchmark`);
     if (!r.ok) { setTimeout(init, 1500); return; }   // retry until backend ready
     const d = await r.json();
-    speedInfo = `${d.squarings_per_sec.toLocaleString()} squarings/sec`;
+    speedInfo = `${d.squarings_per_sec.toLocaleString()} squarings/sec @ ${d.benchmark_bits}-bit RSA`;
     onDateChange();   // now compute t for the default datetime
   } catch(e) {
     setTimeout(init, 1500);   // backend not up yet, keep retrying silently
@@ -600,6 +606,81 @@ function enableSolve() {
   document.getElementById('solveHint').textContent = 'Unlock time reached — puzzle ready.';
 }
 
+function currentAuthQuery() {
+  const params = new URLSearchParams();
+  if (CURRENT_EXAM_ID) params.set('exam_id', CURRENT_EXAM_ID);
+  if (CURRENT_ACCESS_TOKEN) params.set('access_token', CURRENT_ACCESS_TOKEN);
+  return params.toString();
+}
+
+function currentPublicQuery() {
+  const params = new URLSearchParams();
+  if (CURRENT_EXAM_ID) params.set('exam_id', CURRENT_EXAM_ID);
+  return params.toString();
+}
+
+function resetExamSession() {
+  CURRENT_EXAM_ID = null;
+  CURRENT_ACCESS_TOKEN = null;
+  CURRENT_PUZZLE = null;
+  STATE_encrypted = false;
+  document.getElementById('btnGenerateProof').classList.add('hidden');
+  document.getElementById('btnGenerateProof').disabled = true;
+  document.getElementById('btnGenerateProof').textContent = '🧮 Generate Proof';
+  document.getElementById('btnVerify').classList.add('hidden');
+  document.getElementById('btnVerify').disabled = true;
+  document.getElementById('btnVerify').textContent = '⚡ Verify Proof instantly';
+  document.getElementById('btnVerify').style.background = '';
+  document.getElementById('btnVerify').style.color = '';
+  document.getElementById('btnVerify').style.borderColor = '';
+  document.getElementById('vdfProofLabel').style.display = 'none';
+  document.getElementById('vdfProofBox').style.display = 'none';
+  document.getElementById('vdfProofBox').textContent = '';
+}
+
+function renderProofState(d) {
+  const proofBox = document.getElementById('vdfProofBox');
+  const label = document.getElementById('vdfProofLabel');
+  const btnGenerate = document.getElementById('btnGenerateProof');
+  const btnVerify = document.getElementById('btnVerify');
+
+  if (d.vdf_proof && d.vdf_proof.length > 0) {
+    label.style.display = 'block';
+    proofBox.style.display = 'block';
+    let proofHtml;
+    if (CURRENT_PUZZLE && CURRENT_PUZZLE.scheme === 'wesolowski') {
+      proofHtml = `π = ${d.vdf_proof[0].pi}`;
+    } else {
+      proofHtml = d.vdf_proof.map(p => `t=${p.t}: μ=${p.mu}`).join('<br>');
+    }
+    proofBox.innerHTML = `y = ${d.y_hex}<br>${proofHtml}`;
+    btnGenerate.classList.add('hidden');
+    btnGenerate.disabled = true;
+    btnGenerate.textContent = '🧮 Generate Proof';
+    btnVerify.classList.remove('hidden');
+    btnVerify.disabled = false;
+    return;
+  }
+
+  label.style.display = 'none';
+  proofBox.style.display = 'none';
+  proofBox.textContent = '';
+  btnVerify.classList.add('hidden');
+  btnVerify.disabled = true;
+
+  if (d.status === 'done' && d.y_hex) {
+    btnGenerate.classList.remove('hidden');
+    btnGenerate.disabled = d.proof_status === 'running';
+    btnGenerate.textContent = d.proof_status === 'running'
+      ? `🧮 Generating Proof ${Math.round(d.proof_progress || 0)}%`
+      : '🧮 Generate Proof';
+  } else {
+    btnGenerate.classList.add('hidden');
+    btnGenerate.disabled = true;
+    btnGenerate.textContent = '🧮 Generate Proof';
+  }
+}
+
 // ── Pill ─────────────────────────────────────────────────
 function setPill(p) {
   const el = document.getElementById('pill');
@@ -619,6 +700,7 @@ function setStep(id,state) {
 // ── ENCRYPT ──────────────────────────────────────────────
 async function runEncrypt() {
   if (!tSquarings) { alert('Please set an unlock time first.'); return; }
+  resetExamSession();
 
   let fetchOpts;
   if (ACTIVE_TAB === 'text') {
@@ -648,10 +730,13 @@ async function runEncrypt() {
     const r = await fetch(`${API}/encrypt`, fetchOpts);
     const d = await r.json();
     if (d.error) { alert(d.error); document.getElementById('btnEncrypt').disabled=false; return; }
+    CURRENT_EXAM_ID = d.exam_id;
+    CURRENT_ACCESS_TOKEN = d.access_token;
+    CURRENT_PUZZLE = d.puzzle_public || null;
     setTimeout(()=>setStep('s1','done'),150);
     setTimeout(()=>setStep('s2','done'),400);
     setTimeout(()=>{setStep('s3','done'); document.getElementById('sd3').textContent=`H(exam): ${d.H_exam.slice(0,14)}… H(K): ${d.H_key.slice(0,14)}…`;},700);
-    setTimeout(()=>{setStep('s4','done'); document.getElementById('sd4').textContent=`t = ${d.t_squarings.toLocaleString()}  |  ${d.bits}-bit RSA`;},1100);
+    setTimeout(()=>{setStep('s4','done'); document.getElementById('sd4').textContent=`${d.scheme}  |  t = ${d.t_squarings.toLocaleString()}  |  ${d.bits}-bit RSA`;},1100);
     setTimeout(()=>setStep('s5','erased'),1500);
     setTimeout(()=>setStep('s6','done'),1900);
     document.getElementById('commitCard').classList.remove('hidden');
@@ -689,48 +774,104 @@ function startSqVis(t) {
 function stopSqVis() {
   clearInterval(visTimer);
   const vis=document.getElementById('sqVis');
+  if (vis.lastChild && vis.lastChild.textContent === '✔  Key recovered.') return;
   const l=document.createElement('div'); l.className='sq-line';
   l.style.color='var(--green)'; l.textContent='✔  Key recovered.';
   vis.appendChild(l);
 }
 
 async function runSolve() {
+  if (!CURRENT_EXAM_ID || !CURRENT_ACCESS_TOKEN) { alert('Encrypt an exam first.'); return; }
   document.getElementById('btnSolve').disabled=true;
   document.getElementById('solveSection').classList.remove('hidden');
   setPill('solving'); startSqVis(tSquarings||3000);
   try {
-    await fetch(`${API}/solve`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const r = await fetch(`${API}/solve`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ exam_id: CURRENT_EXAM_ID, access_token: CURRENT_ACCESS_TOKEN })
+    });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
     solveTimer=setInterval(pollProgress,300);
-  } catch(e) { alert('Backend unreachable.'); }
+  } catch(e) {
+    setPill('ready');
+    document.getElementById('btnSolve').disabled = false;
+    alert(e.message || 'Backend unreachable.');
+  }
+}
+
+async function runGenerateProof() {
+  if (!CURRENT_EXAM_ID || !CURRENT_ACCESS_TOKEN) { alert('Solve an exam first.'); return; }
+  const btn = document.getElementById('btnGenerateProof');
+  btn.disabled = true;
+  btn.textContent = '🧮 Generating Proof...';
+  document.getElementById('solveHint').textContent = 'Generating public proof from solved output...';
+  try {
+    const r = await fetch(`${API}/generate_proof`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ exam_id: CURRENT_EXAM_ID, access_token: CURRENT_ACCESS_TOKEN })
+    });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    solveTimer = setInterval(pollProgress, 300);
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = '🧮 Generate Proof';
+    alert(e.message || 'Proof generation failed.');
+  }
 }
 
 async function pollProgress() {
   try {
-    const r=await fetch(`${API}/progress`); const d=await r.json();
-    const pct=Math.round(d.progress||0);
-    document.getElementById('progBar').style.width=pct+'%';
-    document.getElementById('progPct').textContent=pct+'%';
-    if(d.status==='done'){
-        clearInterval(solveTimer);
-        stopSqVis();
-        setPill('done');
-        
-        // Show proof data
-        const proofBox = document.getElementById('vdfProofBox');
-        if (d.vdf_proof && d.vdf_proof.length > 0) {
-            document.getElementById('vdfProofLabel').style.display = 'block';
-            proofBox.style.display = 'block';
-            let proofHtml = d.vdf_proof.map(p => `t=${p.t}: μ=${p.mu}`).join('<br>');
-            proofBox.innerHTML = `y = ${d.y_hex}<br>` + proofHtml;
-            document.getElementById('btnVerify').classList.remove('hidden');
-            document.getElementById('btnVerify').disabled = false;
-        }
+    const r = await fetch(`${API}/progress?${currentAuthQuery()}`);
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    const activeProof = d.proof_status === 'running';
+    const pct = Math.round(activeProof ? (d.proof_progress || 0) : (d.progress || 0));
+    document.getElementById('progBar').style.width = pct + '%';
+    document.getElementById('progPct').textContent = pct + '%';
 
-        showResult(d);
-        loadAudit();
+    if (d.status === 'running') {
+      document.getElementById('solveHint').textContent = 'Evaluating VDF...';
+      return;
     }
-    else if(d.status==='error'){clearInterval(solveTimer);setPill('idle');alert('Solve failed.');}
-  } catch(e){}
+
+    if (activeProof) {
+      document.getElementById('solveHint').textContent = 'Generating proof...';
+      renderProofState(d);
+      return;
+    }
+
+    if (d.status === 'error') {
+      clearInterval(solveTimer);
+      setPill('idle');
+      alert(d.error || 'Solve failed.');
+      return;
+    }
+
+    if (d.proof_status === 'error') {
+      clearInterval(solveTimer);
+      renderProofState(d);
+      alert(d.proof_error || 'Proof generation failed.');
+      return;
+    }
+
+    if (d.status === 'done') {
+      clearInterval(solveTimer);
+      stopSqVis();
+      setPill('done');
+      document.getElementById('solveHint').textContent = 'Solved. Generate a proof if you need public verification.';
+      renderProofState(d);
+      showResult(d);
+      loadAudit();
+    }
+  } catch(e){
+    clearInterval(solveTimer);
+    setPill('idle');
+    alert(e.message || 'Could not fetch progress.');
+  }
 }
 
 function showResult(d) {
@@ -751,6 +892,7 @@ function showResult(d) {
 
   if (d.key_verified) {
     wrap.classList.remove('hidden');
+    const authQuery = currentAuthQuery();
 
     if (mime.startsWith('image/') && d.decrypted_b64) {
       // Inline image display
@@ -760,6 +902,7 @@ function showResult(d) {
       examOut.style.display = 'none';
       btnDl.classList.remove('hidden');
       btnDl.textContent = `⬇ Download ${d.filename||'image'}`;
+      btnDl.href = `${API}/download?${authQuery}`;
     } else if (mime === 'application/pdf' && d.decrypted_b64) {
       // PDF — show download button
       label.textContent = `▼ Decrypted PDF  [${d.filename||'exam.pdf'}]`;
@@ -767,6 +910,7 @@ function showResult(d) {
       examOut.style.display = 'none';
       btnDl.classList.remove('hidden');
       btnDl.textContent = `⬇ Download ${d.filename||'exam.pdf'}`;
+      btnDl.href = `${API}/download?${authQuery}`;
     } else if (d.decrypted_text) {
       // Plain text
       label.textContent = '▼ Decrypted Exam';
@@ -779,13 +923,16 @@ function showResult(d) {
 }
 
 async function loadAudit() {
+  if (!CURRENT_EXAM_ID) return;
   try {
-    const r=await fetch(`${API}/audit`); const d=await r.json();
+    const r = await fetch(`${API}/audit?${currentPublicQuery()}`);
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
     const badge=document.getElementById('chainBadge');
     badge.classList.remove('hidden');
     badge.className='chain-badge '+(d.chain_valid?'valid':'invalid');
     badge.innerHTML=d.chain_valid?'<span>✔</span><span>Hash chain verified</span>':'<span>✖</span><span>Chain tampered!</span>';
-    const colors={EXAM_COMMITMENT:'var(--accent)',TIME_LOCK_PUZZLE:'var(--warn)',KEY_ERASURE_DECLARATION:'var(--red)'};
+    const colors={EXAM_COMMITMENT:'var(--accent)',VDF_PUZZLE:'var(--warn)',KEY_ERASURE_DECLARATION:'var(--red)'};
     document.getElementById('auditEntries').innerHTML=(d.log||[]).map(r=>`
       <div class="audit-entry">
         <div class="audit-type" style="color:${colors[r.type]||'var(--text)'}">[${r.seq}] ${r.type}</div>
@@ -796,46 +943,38 @@ async function loadAudit() {
 }
 
 async function runVerify() {
+  if (!CURRENT_PUZZLE) { alert('No puzzle metadata available.'); return; }
   const btn = document.getElementById('btnVerify');
   btn.disabled = true;
   btn.textContent = 'Verifying...';
   try {
-    const r = await fetch(`${API}/progress`);
-    const state = await r.json();
-    
-    // We fetch the public parameters from the original puzzle audit or backend state
-    // For simplicity, we can fetch from the backend progress 
-    // though in reality anyone can verify just from the audit log
-    
-    // Actually we need N, g, t from the puzzle state.
-    // Let's rely on the frontend State variables if we mapped them, or just alert.
-    // Wait, let's fetch the puzzle from the audit log!
-    const auditRes = await fetch(`${API}/audit`);
-    const auditData = await auditRes.json();
-    const puzzleEntry = auditData.log.find(e => e.type === 'VDF_PUZZLE');
-    if (!puzzleEntry) { alert('Could not find puzzle in audit log!'); return; }
-    
-    // N_hex, g_hex, t
-    // (Note: we need the full objects from audit log, but audit.to_list truncates hashes! 
-    // We should fix that or fetch full puzzle state from a new endpoint. 
-    // For demo purposes let's just use the fact the backend has it stored, or we can fetch full log.)
-
-    // Instead of parsing the truncated log, let's just ask the server to do the math verification
-    // Since we didn't save N and g in the JS frontend state, we'll just demonstrate the endpoint:
-    alert("Verification pinging the endpoint with the proofs...");
-    
-    // We can rebuild this properly later if needed, for now let's just visually acknowledge
-    setTimeout(() => {
-        btn.textContent = '✔ Verified in < 15ms';
-        btn.classList.remove('btn-primary');
-        btn.classList.add('btn-danger'); // Green visual if you override it
-        btn.style.background = 'rgba(127,255,110,.1)';
-        btn.style.color = 'var(--green)';
-        btn.style.borderColor = 'var(--green)';
-    }, 400);
-
+    const progressRes = await fetch(`${API}/progress?${currentAuthQuery()}`);
+    const state = await progressRes.json();
+    if (state.error) throw new Error(state.error);
+    const verifyRes = await fetch(`${API}/verify_vdf`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        N: CURRENT_PUZZLE.N_hex,
+        g: CURRENT_PUZZLE.g_hex,
+        y: state.y_hex,
+        t: CURRENT_PUZZLE.t,
+        scheme: CURRENT_PUZZLE.scheme,
+        pi: state.vdf_proof,
+      }),
+    });
+    const result = await verifyRes.json();
+    if (result.error) throw new Error(result.error);
+    if (!result.is_valid) throw new Error('Proof verification failed.');
+    btn.textContent = `✔ Verified in ${result.verification_time_ms} ms`;
+    btn.classList.remove('btn-primary');
+    btn.style.background = 'rgba(127,255,110,.1)';
+    btn.style.color = 'var(--green)';
+    btn.style.borderColor = 'var(--green)';
   } catch (e) {
-    alert("Verification failed");
+    btn.disabled = false;
+    btn.textContent = '⚡ Verify Proof instantly';
+    alert(e.message || 'Verification failed');
   }
 }
 

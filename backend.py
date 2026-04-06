@@ -14,18 +14,21 @@ Run:  python backend.py
 URL:  http://localhost:5050
 """
 
-import os, json, time, hashlib, secrets, threading, base64
+import os, json, time, hashlib, secrets, threading, base64, traceback, multiprocessing
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Optional, Tuple, Dict, Any
 from flask import Flask, jsonify, request, make_response, send_file
 import io
 
 from math_utils import _gen_prime
+from math_utils import guralnick_muller_poly_eval
 from crypto_utils import (
     aes_encrypt,
     aes_decrypt,
     eval_vdf,
+    generate_vdf_proof,
     verify_vdf,
+    sequential_squaring_eval,
     generate_vdf_puzzle_with_trapdoor,
     # Wesolowski
     generate_vdf_setup,
@@ -57,9 +60,11 @@ from crypto_utils import (
 )
 from audit import AuditLog
 
-app   = Flask(__name__)
-STATE = {}
-AUDIT = AuditLog()
+app = Flask(__name__)
+EXAMS = {}
+EXAMS_LOCK = threading.Lock()
+DEFAULT_EXAM_VDF_BITS = 1024
+ENCRYPT_WORKER_TIMEOUT_S = 60
 
 # Measured once at startup
 SQUARING_TIME_S = None
@@ -71,7 +76,10 @@ SQUARING_TIME_S = None
 
 @app.after_request
 def add_cors(r):
-    r.headers["Access-Control-Allow-Origin"]  = "*"
+    origin = request.headers.get("Origin")
+    if origin in {"null", "http://localhost:5050", "http://127.0.0.1:5050"}:
+        r.headers["Access-Control-Allow-Origin"] = origin
+        r.headers["Vary"] = "Origin"
     r.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Requested-With"
     r.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return r
@@ -82,6 +90,157 @@ def _options(p):
     return make_response("", 204)
 
 
+def _request_data():
+    """Return request payload regardless of JSON/form/query transport."""
+    if request.method == "GET":
+        return request.args
+    if request.is_json:
+        return request.get_json(silent=True) or {}
+    return request.form or {}
+
+
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def _require_pietrzak_t(t: int):
+    if not _is_power_of_two(t):
+        raise ValueError("Pietrzak currently requires t to be a positive power of two")
+
+
+def _make_exam_id() -> str:
+    return f"EXAM-{secrets.token_hex(8).upper()}"
+
+
+def _encrypt_exam_worker(raw_bytes: bytes, t: int, bits: int, scheme: str, conn):
+    """
+    Perform key generation, encryption, and puzzle creation inside a short-lived
+    worker process so the AES key never exists in the Flask process.
+    """
+    try:
+        key = secrets.token_bytes(32)
+        nonce, ciphertext = aes_encrypt(raw_bytes, key)
+        puzzle = generate_vdf_puzzle_with_trapdoor(key, t, bits)
+        puzzle["scheme"] = scheme
+        conn.send({
+            "nonce_hex": nonce.hex(),
+            "ciphertext_hex": ciphertext.hex(),
+            "H_exam": hashlib.sha256(raw_bytes).hexdigest(),
+            "H_key": hashlib.sha256(key).hexdigest(),
+            "puzzle": puzzle,
+        })
+    except Exception as exc:
+        conn.send({"error": str(exc)})
+    finally:
+        conn.close()
+
+
+def _encrypt_exam_in_worker(raw_bytes: bytes, t: int, bits: int, scheme: str) -> dict:
+    ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(
+        target=_encrypt_exam_worker,
+        args=(raw_bytes, t, bits, scheme, child_conn),
+        daemon=False,
+    )
+    proc.start()
+    child_conn.close()
+
+    try:
+        if not parent_conn.poll(ENCRYPT_WORKER_TIMEOUT_S):
+            proc.terminate()
+            proc.join(timeout=5)
+            raise TimeoutError("Encryption worker timed out")
+        result = parent_conn.recv()
+    finally:
+        parent_conn.close()
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+
+    if proc.exitcode not in (0, None) and "error" not in result:
+        raise RuntimeError(f"Encryption worker exited with code {proc.exitcode}")
+    if "error" in result:
+        raise RuntimeError(result["error"])
+    return result
+
+
+def _build_exam_record(
+    exam_id: str,
+    access_token: str,
+    audit_log: AuditLog,
+    nonce: bytes,
+    ciphertext: bytes,
+    puzzle: dict,
+    h_exam: str,
+    h_key: str,
+    mime_type: str,
+    filename: str,
+):
+    return {
+        "exam_id": exam_id,
+        "access_token": access_token,
+        "audit": audit_log,
+        "nonce_hex": nonce.hex(),
+        "ciphertext_hex": ciphertext.hex(),
+        "puzzle": puzzle,
+        "H_exam": h_exam,
+        "H_key": h_key,
+        "mime_type": mime_type,
+        "filename": filename,
+        "solve_progress": 0,
+        "solve_status": "idle",
+        "solve_error": None,
+        "solve_time_s": None,
+        "recovered_key_hex": None,
+        "decrypted_text": None,
+        "decrypted_b64": None,
+        "key_verified": None,
+        "exam_verified": None,
+        "vdf_proof": [],
+        "y_hex": None,
+        "proof_status": "idle",
+        "proof_progress": 0,
+        "proof_error": None,
+        "scheme": puzzle.get("scheme"),
+    }
+
+
+def _get_exam(exam_id: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[Tuple]]:
+    if not exam_id:
+        return None, (jsonify({"error": "exam_id required"}), 400)
+    exam = EXAMS.get(exam_id)
+    if not exam:
+        return None, (jsonify({"error": "Unknown exam_id"}), 404)
+    return exam, None
+
+
+def _require_exam_access() -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[Tuple]]:
+    data = _request_data()
+    exam_id = data.get("exam_id")
+    token = data.get("access_token")
+    exam, error = _get_exam(exam_id)
+    if error:
+        return None, None, error
+    if exam is None:
+        return None, None, (jsonify({"error": "Exam not found"}), 404)
+    if token != exam["access_token"]:
+        return None, None, (jsonify({"error": "Invalid access token"}), 403)
+    return exam_id, exam, None
+
+
+def _get_public_exam() -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[Tuple]]:
+    data = _request_data()
+    exam_id = data.get("exam_id")
+    exam, error = _get_exam(exam_id)
+    if error:
+        return None, None, error
+    if exam is None:
+        return None, None, (jsonify({"error": "Exam not found"}), 404)
+    return exam_id, exam, None
+
+
 # ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
@@ -89,7 +248,8 @@ def _options(p):
 def _run_benchmark():
     global SQUARING_TIME_S
     print("  ⏱  Benchmarking CPU squaring speed…", end=" ", flush=True)
-    p = _gen_prime(256); q = _gen_prime(256)
+    half = DEFAULT_EXAM_VDF_BITS // 2
+    p = _gen_prime(half); q = _gen_prime(half)
     n = p * q
     x = secrets.randbelow(n - 2) + 2
     for _ in range(500):
@@ -109,6 +269,7 @@ def api_benchmark():
     return jsonify({
         "squaring_time_s": SQUARING_TIME_S,
         "squarings_per_sec": int(1 / SQUARING_TIME_S),
+        "benchmark_bits": DEFAULT_EXAM_VDF_BITS,
     })
 
 
@@ -176,7 +337,7 @@ def api_schemes():
                 "proof_size": "O(log t) — one element per halving level",
                 "verify_time": "O(log t) — one exponentiation per level",
                 "description": "Recursive halving proof based on RSA group. "
-                               "Each level proves the midpoint μ = g^(2^(t/2))."
+                               "This implementation currently supports positive power-of-two delays."
             },
             {
                 "id": "hash_chain",
@@ -192,7 +353,7 @@ def api_schemes():
                 "name": "Sloth Weak VDF",
                 "paper_section": "§7.1",
                 "proof_size": "None (decodable)",
-                "verify_time": "O(iterations) multiplications",
+                "verify_time": "Deterministic re-evaluation",
                 "description": "Iterated modular square roots mod p. Verify by squaring. "
                                "Weak VDF per Definition 5 (requires O(t) parallelism)."
             },
@@ -201,9 +362,9 @@ def api_schemes():
                 "name": "Sloth++ Weak VDF",
                 "paper_section": "§7.1 (extension)",
                 "proof_size": "None (decodable)",
-                "verify_time": "Only 4 Fp-gates per step (7,000× improvement over SHA-256)",
-                "description": "Sloth over Fp² extension field. Dramatically reduces SNARK "
-                               "verification circuit size when used as inner function for IVC."
+                "verify_time": "Deterministic re-evaluation",
+                "description": "Deterministic Fp² demonstration that keeps evaluation and "
+                               "verification aligned on all supported inputs."
             },
             {
                 "id": "rational_map",
@@ -240,8 +401,6 @@ def api_encrypt():
     - multipart/form-data: 'file' field (PDF/image), plus 'mime_type', 't_squarings', 'bits', 'scheme'
     - application/json:    {exam_text, t_squarings, bits, scheme}
     """
-    global AUDIT, STATE
-
     # ── Detect input mode ────────────────────────────────────────────────────
     if request.content_type and "multipart/form-data" in request.content_type:
         # File upload path
@@ -252,7 +411,7 @@ def api_encrypt():
         mime_type = request.form.get("mime_type") or file_obj.mimetype or "application/octet-stream"
         filename  = file_obj.filename or "exam_file"
         t         = int(request.form.get("t_squarings", 3000))
-        bits      = int(request.form.get("bits", 1024))
+        bits      = int(request.form.get("bits", DEFAULT_EXAM_VDF_BITS))
         scheme    = request.form.get("scheme", "wesolowski")
         # Label used when displaying file size etc.
         content_label = f"{filename} ({len(raw_bytes):,} bytes)"
@@ -266,7 +425,7 @@ def api_encrypt():
         mime_type = "text/plain"
         filename  = "exam.txt"
         t         = int(data.get("t_squarings", 3000))
-        bits      = int(data.get("bits", 1024))
+        bits      = int(data.get("bits", DEFAULT_EXAM_VDF_BITS))
         scheme    = data.get("scheme", "wesolowski")
         content_label = f"{len(raw_bytes):,} bytes"
 
@@ -274,130 +433,215 @@ def api_encrypt():
         return jsonify({"error": "Empty content"}), 400
     if scheme not in ("wesolowski", "pietrzak"):
         return jsonify({"error": "scheme must be 'wesolowski' or 'pietrzak'"}), 400
+    if scheme == "pietrzak":
+        try:
+            _require_pietrzak_t(t)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
 
     # ── Encrypt ──────────────────────────────────────────────────────────────
-    AUDIT = AuditLog(); STATE = {}
-    exam_id = f"EXAM-{secrets.token_hex(4).upper()}"
-    key     = secrets.token_bytes(32)
-    nonce, ct = aes_encrypt(raw_bytes, key)
-    H_exam  = hashlib.sha256(raw_bytes).hexdigest()
-    H_key   = hashlib.sha256(key).hexdigest()
+    audit_log = AuditLog()
+    exam_id = _make_exam_id()
+    access_token = secrets.token_hex(32)
+    try:
+        worker_result = _encrypt_exam_in_worker(raw_bytes, t, bits, scheme)
+    except Exception as exc:
+        return jsonify({"error": f"Encryption worker failed: {exc}"}), 500
 
-    AUDIT.append({"type": "EXAM_COMMITMENT", "exam_id": exam_id,
-                  "H_exam": H_exam, "H_key": H_key,
-                  "nonce_hex": nonce.hex(), "mime_type": mime_type, "filename": filename})
+    nonce_hex = worker_result["nonce_hex"]
+    ciphertext_hex = worker_result["ciphertext_hex"]
+    H_exam = worker_result["H_exam"]
+    H_key = worker_result["H_key"]
+    puzzle = worker_result["puzzle"]
 
-    puzzle = generate_vdf_puzzle_with_trapdoor(key, t, bits)
-    puzzle["scheme"] = scheme
+    audit_log.append({"type": "EXAM_COMMITMENT", "exam_id": exam_id,
+                      "H_exam": H_exam, "H_key": H_key,
+                      "nonce_hex": nonce_hex, "mime_type": mime_type, "filename": filename})
 
-    AUDIT.append({"type": "VDF_PUZZLE", "exam_id": exam_id,
-                  "N_hex": puzzle["N"], "g_hex": puzzle["g"],
-                  "t": t, "locked_key": puzzle["locked_key"],
-                  "bits": bits, "scheme": scheme})
-    key = b"\x00" * 32; del key
-    AUDIT.append({"type": "KEY_ERASURE_DECLARATION", "exam_id": exam_id,
-                  "ts": datetime.now(timezone.utc).isoformat()})
+    audit_log.append({"type": "VDF_PUZZLE", "exam_id": exam_id,
+                      "N_hex": puzzle["N"], "g_hex": puzzle["g"],
+                      "t": t, "locked_key": puzzle["locked_key"],
+                      "bits": bits, "scheme": scheme})
+    audit_log.append({"type": "KEY_ERASURE_DECLARATION", "exam_id": exam_id,
+                      "mode": "ephemeral_worker_process_terminated",
+                      "ts": datetime.now(timezone.utc).isoformat()})
 
-    STATE.update({
-        "exam_id": exam_id, "nonce_hex": nonce.hex(),
-        "ciphertext_hex": ct.hex(), "puzzle": puzzle,
-        "H_exam": H_exam, "H_key": H_key,
-        "mime_type": mime_type, "filename": filename,
-        "solve_progress": 0, "solve_status": "idle",
-        "recovered_key_hex": None, "decrypted_text": None,
-        "decrypted_b64": None,
-        "key_verified": None, "exam_verified": None, "vdf_proof": [],
-        "scheme": scheme,
-    })
+    exam_record = _build_exam_record(
+        exam_id=exam_id,
+        access_token=access_token,
+        audit_log=audit_log,
+        nonce=bytes.fromhex(nonce_hex),
+        ciphertext=bytes.fromhex(ciphertext_hex),
+        puzzle=puzzle,
+        h_exam=H_exam,
+        h_key=H_key,
+        mime_type=mime_type,
+        filename=filename,
+    )
+    with EXAMS_LOCK:
+        EXAMS[exam_id] = exam_record
     return jsonify({
         "exam_id": exam_id, "H_exam": H_exam, "H_key": H_key,
-        "nonce_hex": nonce.hex(),
-        "ciphertext_preview": ct.hex()[:48] + "…",
-        "ciphertext_len": len(ct), "t_squarings": t,
+        "access_token": access_token,
+        "nonce_hex": nonce_hex,
+        "ciphertext_preview": ciphertext_hex[:48] + "…",
+        "ciphertext_len": len(ciphertext_hex) // 2, "t_squarings": t,
         "bits": bits, "scheme": scheme,
         "mime_type": mime_type, "filename": filename,
         "content_label": content_label,
+        "puzzle_public": {
+            "N_hex": puzzle["N"],
+            "g_hex": puzzle["g"],
+            "t": t,
+            "scheme": scheme,
+        },
     })
 
 
 @app.route("/api/solve", methods=["POST"])
 def api_solve():
     """Evaluate the VDF as a solver — the slow delay step."""
-    if not STATE.get("puzzle"):
+    exam_id, exam, error = _require_exam_access()
+    if error:
+        return error
+    if exam is None:
+        return jsonify({"error": "Exam not found"}), 404
+    if not exam.get("puzzle"):
         return jsonify({"error": "No active exam"}), 400
-    if STATE.get("solve_status") == "running":
+    if exam.get("solve_status") == "running":
         return jsonify({"error": "Already running"}), 400
-    STATE["solve_status"] = "running"; STATE["solve_progress"] = 0
+    exam["solve_status"] = "running"
+    exam["solve_progress"] = 0
+    exam["solve_error"] = None
+    exam["proof_status"] = "idle"
+    exam["proof_progress"] = 0
+    exam["proof_error"] = None
+    exam["vdf_proof"] = []
 
     def run():
         t0 = time.perf_counter()
         try:
-            puzzle = STATE["puzzle"]
+            puzzle = exam["puzzle"]
             N = int(puzzle["N"], 16)
             g = int(puzzle["g"], 16)
             t = puzzle["t"]
             locked_key = bytes.fromhex(puzzle["locked_key"])
             scheme = puzzle.get("scheme", "wesolowski")
 
-            y, pi, mask = eval_vdf(
+            y, mask = sequential_squaring_eval(
                 N, g, t,
-                progress_cb=lambda p: STATE.update({"solve_progress": p}),
-                scheme=scheme,
+                progress_cb=lambda p: exam.update({"solve_progress": p}),
             )
             recovered = bytes(a ^ b for a, b in zip(locked_key, mask[: len(locked_key)]))
-            key_ok = hashlib.sha256(recovered).hexdigest() == STATE["H_key"]
-            STATE["key_verified"] = key_ok
-            STATE["recovered_key_hex"] = recovered.hex()[:32] + "…"
+            key_ok = hashlib.sha256(recovered).hexdigest() == exam["H_key"]
+            exam["key_verified"] = key_ok
+            exam["recovered_key_hex"] = recovered.hex()[:32] + "…"
 
-            # Serialise proof
-            if scheme == "wesolowski":
-                STATE["vdf_proof"] = [{"pi": hex(pi)}]
-            else:
-                STATE["vdf_proof"] = [{"mu": hex(mu), "t": tl} for mu, tl in pi]
-            STATE["y_hex"] = hex(y)
+            # Exam recovery needs y for the published commitment but skips proof
+            # generation because proof construction dominates runtime for large t.
+            exam["vdf_proof"] = []
+            exam["y_hex"] = hex(y)
 
             if key_ok:
                 pt = aes_decrypt(
-                    bytes.fromhex(STATE["nonce_hex"]),
-                    bytes.fromhex(STATE["ciphertext_hex"]),
+                    bytes.fromhex(exam["nonce_hex"]),
+                    bytes.fromhex(exam["ciphertext_hex"]),
                     recovered,
                 )
-                STATE["exam_verified"] = hashlib.sha256(pt).hexdigest() == STATE["H_exam"]
-                mime = STATE.get("mime_type", "text/plain")
+                exam["exam_verified"] = hashlib.sha256(pt).hexdigest() == exam["H_exam"]
+                mime = exam.get("mime_type", "text/plain")
                 if mime == "text/plain":
-                    STATE["decrypted_text"] = pt.decode(errors="replace")
-                    STATE["decrypted_b64"]  = None
+                    exam["decrypted_text"] = pt.decode(errors="replace")
+                    exam["decrypted_b64"] = None
                 else:
                     # Binary: store as base64 so frontend can download/preview
-                    STATE["decrypted_text"] = None
-                    STATE["decrypted_b64"]  = base64.b64encode(pt).decode()
-            STATE["solve_time_s"] = round(time.perf_counter() - t0, 3)
-            STATE["solve_status"] = "done"
+                    exam["decrypted_text"] = None
+                    exam["decrypted_b64"] = base64.b64encode(pt).decode()
+            exam["solve_time_s"] = round(time.perf_counter() - t0, 3)
+            exam["solve_status"] = "done"
         except Exception as e:
-            import traceback; traceback.print_exc()
-            STATE["solve_status"] = "error"; STATE["solve_error"] = str(e)
+            traceback.print_exc()
+            exam["solve_status"] = "error"
+            exam["solve_error"] = str(e)
 
     threading.Thread(target=run, daemon=True).start()
-    return jsonify({"status": "started"})
+    return jsonify({"status": "started", "exam_id": exam_id})
 
 
 @app.route("/api/download", methods=["GET"])
 def api_download():
     """Download the decrypted binary file (PDF / image) after VDF solve."""
-    if STATE.get("solve_status") != "done":
+    _, exam, error = _require_exam_access()
+    if error:
+        return error
+    if exam is None:
+        return jsonify({"error": "Exam not found"}), 404
+    if exam.get("solve_status") != "done":
         return jsonify({"error": "Not ready"}), 400
-    b64 = STATE.get("decrypted_b64")
+    b64 = exam.get("decrypted_b64")
     if not b64:
         return jsonify({"error": "No binary file to download (text-only exam)"}), 400
     data = base64.b64decode(b64)
-    mime = STATE.get("mime_type", "application/octet-stream")
-    fname = STATE.get("filename", "decrypted_exam")
+    mime = exam.get("mime_type", "application/octet-stream")
+    fname = exam.get("filename", "decrypted_exam")
     return send_file(
         io.BytesIO(data),
         mimetype=mime,
         as_attachment=True,
         download_name=fname,
     )
+
+
+@app.route("/api/generate_proof", methods=["POST"])
+def api_generate_proof():
+    """
+    Generate a VDF proof after the exam has already been solved.
+    """
+    exam_id, exam, error = _require_exam_access()
+    if error:
+        return error
+    if exam is None:
+        return jsonify({"error": "Exam not found"}), 404
+    if exam.get("solve_status") != "done" or not exam.get("y_hex"):
+        return jsonify({"error": "Solve the exam first"}), 400
+    if exam.get("proof_status") == "running":
+        return jsonify({"error": "Proof generation already running"}), 400
+    if exam.get("vdf_proof"):
+        return jsonify({"status": "already_generated", "exam_id": exam_id}), 200
+
+    exam["proof_status"] = "running"
+    exam["proof_progress"] = 0
+    exam["proof_error"] = None
+
+    def run():
+        try:
+            puzzle = exam["puzzle"]
+            N = int(puzzle["N"], 16)
+            g = int(puzzle["g"], 16)
+            y = int(exam["y_hex"], 16)
+            t = puzzle["t"]
+            scheme = puzzle.get("scheme", "wesolowski")
+
+            pi = generate_vdf_proof(
+                N, g, y, t,
+                scheme=scheme,
+                progress_cb=lambda p: exam.update({"proof_progress": p}),
+            )
+
+            if scheme == "wesolowski":
+                assert isinstance(pi, int)
+                exam["vdf_proof"] = [{"pi": hex(pi)}]
+            else:
+                assert isinstance(pi, list)
+                exam["vdf_proof"] = [{"mu": hex(mu), "t": tl} for mu, tl in pi]
+            exam["proof_status"] = "done"
+            exam["proof_progress"] = 100
+        except Exception as exc:
+            exam["proof_status"] = "error"
+            exam["proof_error"] = str(exc)
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"status": "started", "exam_id": exam_id})
 
 
 @app.route("/api/verify_vdf", methods=["POST"])
@@ -412,32 +656,30 @@ def api_verify_vdf():
         g_val = data.get("g")
         y_val = data.get("y")
         t_val = data.get("t")
-
+        
         if N_val is None or g_val is None or y_val is None or t_val is None:
             return jsonify({"error": "N, g, y, t are required"}), 400
-
+        
         N = int(str(N_val), 16)
         g = int(str(g_val), 16)
         y = int(str(y_val), 16)
         t = int(str(t_val))
+        
         scheme = data.get("scheme", "wesolowski")
         pi_raw = data.get("pi")
 
         if scheme == "wesolowski":
-            if (
-                isinstance(pi_raw, list)
-                and pi_raw
-                and isinstance(pi_raw[0], dict)
-                and "pi" in pi_raw[0]
-            ):
+            if pi_raw is None:
+                return jsonify({"error": "pi is required for wesolowski scheme"}), 400
+            if isinstance(pi_raw, list) and pi_raw and isinstance(pi_raw[0], dict) and "pi" in pi_raw[0]:
                 pi = int(pi_raw[0]["pi"], 16)
             else:
                 if pi_raw is None:
                     return jsonify({"error": "pi is required for wesolowski"}), 400
                 pi = int(str(pi_raw), 16)
         elif scheme == "pietrzak":
-            if not isinstance(pi_raw, list):
-                return jsonify({"error": "pi must be a list for pietrzak"}), 400
+            if not isinstance(pi_raw, list) or pi_raw is None:
+                return jsonify({"error": "pi must be a list for pietrzak scheme"}), 400
             pi = [(int(e["mu"], 16), int(e["t"])) for e in pi_raw]
         else:
             return jsonify({"error": f"Unknown scheme: {scheme}"}), 400
@@ -528,6 +770,7 @@ def api_pietrzak_eval():
     try:
         bits = int(data.get("bits", 512))
         t = int(data.get("t", 1000))
+        _require_pietrzak_t(t)
 
         if "N_hex" in data and "g_hex" in data:
             N = int(data["N_hex"], 16)
@@ -664,7 +907,7 @@ def api_sloth_eval():
             "eval_time_s": elapsed,
             "scheme": "sloth",
             "paper_section": "§7.1",
-            "note": "Weak VDF. Verify by forward-squaring y (one mult per step).",
+            "note": "Weak VDF demo. Verification re-evaluates the deterministic round function.",
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -733,9 +976,7 @@ def api_sloth_pp_eval():
             "eval_time_s": elapsed,
             "scheme": "sloth_plus_plus",
             "paper_section": "§7.1",
-            "snark_gates_per_step": 4,
-            "sha256_gates_per_step": 27904,
-            "improvement_factor": "≈7000×",
+            "note": "Deterministic Fp² demo. Verification re-evaluates the same round function.",
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -788,7 +1029,8 @@ def api_rational_map_eval():
         if "x_hex" in data:
             x = int(data["x_hex"], 16) % p
         else:
-            x = secrets.randbelow(p - 1) + 1
+            y_seed = secrets.randbelow(p - 1) + 1
+            x = guralnick_muller_poly_eval(y_seed, a, s, p)
 
         t0 = time.perf_counter()
         y = rational_map_eval(x, p, s, a)
@@ -919,14 +1161,6 @@ def api_beacon():
         result["eval_time_s"] = elapsed
         result["entropy_used"] = entropy_str
 
-        AUDIT.append({
-            "type": "BEACON_COMPUTATION",
-            "entropy_hash": hashlib.sha256(entropy_bytes).hexdigest(),
-            "beacon_hex": result["beacon_hex"],
-            "scheme": scheme, "t": t,
-            "ts": datetime.now(timezone.utc).isoformat(),
-        })
-
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -1030,27 +1264,46 @@ def api_replication_verify():
 
 @app.route("/api/progress")
 def api_progress():
+    _, exam, error = _require_exam_access()
+    if error:
+        return error
+    if exam is None:
+        return jsonify({"error": "Exam not found"}), 404
     return jsonify({
-        "progress": STATE.get("solve_progress", 0),
-        "status": STATE.get("solve_status", "idle"),
-        "key_verified": STATE.get("key_verified"),
-        "exam_verified": STATE.get("exam_verified"),
-        "recovered_key_hex": STATE.get("recovered_key_hex"),
-        "decrypted_text": STATE.get("decrypted_text"),
-        "decrypted_b64": STATE.get("decrypted_b64"),
-        "mime_type": STATE.get("mime_type", "text/plain"),
-        "filename": STATE.get("filename", "exam.txt"),
-        "solve_time_s": STATE.get("solve_time_s"),
-        "vdf_proof": STATE.get("vdf_proof"),
-        "y_hex": STATE.get("y_hex"),
-        "scheme": STATE.get("scheme"),
+        "progress": exam.get("solve_progress", 0),
+        "status": exam.get("solve_status", "idle"),
+        "error": exam.get("solve_error"),
+        "key_verified": exam.get("key_verified"),
+        "exam_verified": exam.get("exam_verified"),
+        "recovered_key_hex": exam.get("recovered_key_hex"),
+        "decrypted_text": exam.get("decrypted_text"),
+        "decrypted_b64": exam.get("decrypted_b64"),
+        "mime_type": exam.get("mime_type", "text/plain"),
+        "filename": exam.get("filename", "exam.txt"),
+        "solve_time_s": exam.get("solve_time_s"),
+        "vdf_proof": exam.get("vdf_proof"),
+        "y_hex": exam.get("y_hex"),
+        "proof_status": exam.get("proof_status", "idle"),
+        "proof_progress": exam.get("proof_progress", 0),
+        "proof_error": exam.get("proof_error"),
+        "scheme": exam.get("scheme"),
     })
 
 
 
 @app.route("/api/audit")
 def api_audit():
-    return jsonify({"log": AUDIT.to_list(), "chain_valid": AUDIT.verify()})
+    exam_id, exam, error = _get_public_exam()
+    if error:
+        return error
+    if exam is None:
+        return jsonify({"error": "Exam not found"}), 404
+    audit_log = exam["audit"]
+    return jsonify({
+        "exam_id": exam_id,
+        "log": audit_log.to_list(),
+        "chain_valid": audit_log.verify(),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1071,6 +1324,6 @@ if __name__ == "__main__":
     print("    POST /api/large_prime/eval      POST /api/large_prime/verify")
     print("    POST /api/beacon            POST /api/beacon/verify")
     print("    POST /api/replication/encode  POST /api/replication/verify")
-    print("    POST /api/encrypt  POST /api/solve  POST /api/verify_vdf")
+    print("    POST /api/encrypt  POST /api/solve  POST /api/generate_proof  POST /api/verify_vdf")
     print()
     app.run(debug=False, port=5050)
