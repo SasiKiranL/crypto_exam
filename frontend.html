@@ -352,6 +352,9 @@ input[type=datetime-local]::-webkit-calendar-picker-indicator{
       <button class="btn btn-danger" id="btnSolve" onclick="runSolve()" disabled>
         🔓 Evaluate VDF
       </button>
+      <button class="btn hidden" id="btnStopSolve" onclick="stopSolve()" style="background:#3a1316;border-color:#8f2a33;color:#ffb7bf" disabled>
+        ⏹ Stop
+      </button>
       <button class="btn btn-primary hidden" id="btnGenerateProof" onclick="runGenerateProof()" disabled>
         🧮 Generate Proof
       </button>
@@ -406,9 +409,13 @@ let cdTimer      = null;
 let solveTimer   = null;
 let visTimer     = null;
 let speedInfo    = '';     // e.g. "20,000 sq/s"
+let pollInFlight = false;
+let pollFailures = 0;
 let CURRENT_EXAM_ID = null;
 let CURRENT_ACCESS_TOKEN = null;
 let CURRENT_PUZZLE = null;
+let CURRENT_SOLVE_STATUS = 'idle';
+let CURRENT_PROOF_STATUS = 'idle';
 
 // ── Upload state ────────────────────────────────────────────
 let ACTIVE_TAB   = 'text';   // 'text' | 'pdf' | 'image'
@@ -500,7 +507,7 @@ function toggleDemo() {
     knob.style.background      = 'var(--green)';
     toggle.style.borderColor   = 'var(--green)';
     toggle.style.background    = 'rgba(127,255,110,.12)';
-    sub.textContent            = 'ON — t fixed at 5,000 squarings (~instant solve)';
+    sub.textContent            = 'ON — t fixed at 5,000 and reduced RSA bits for instant demo';
     sub.style.color            = 'var(--green)';
   } else {
     knob.style.left            = '3px';
@@ -585,7 +592,6 @@ function startCountdown(target) {
         if (el) { el.textContent = '🔓  UNLOCKED'; el.classList.add('unlocked'); }
       });
       clearInterval(cdTimer);
-      document.getElementById('btnSolve').disabled = !document.getElementById('btnEncrypt').disabled || STATE_encrypted;
       if (STATE_encrypted) enableSolve();
       return;
     }
@@ -601,9 +607,36 @@ function startCountdown(target) {
 const pad = n => String(n).padStart(2,'0');
 
 let STATE_encrypted = false;
+
+function isSolveBusy() {
+  return CURRENT_SOLVE_STATUS === 'running' || CURRENT_SOLVE_STATUS === 'stopping';
+}
+
+function syncSolveControls() {
+  const btnSolve = document.getElementById('btnSolve');
+  const btnStop = document.getElementById('btnStopSolve');
+  const solveBusy = isSolveBusy();
+  const proofBusy = CURRENT_PROOF_STATUS === 'running';
+
+  btnStop.classList.toggle('hidden', !solveBusy);
+  btnStop.disabled = CURRENT_SOLVE_STATUS === 'stopping';
+  btnSolve.disabled = !(STATE_encrypted && !solveBusy && !proofBusy);
+}
+
 function enableSolve() {
-  document.getElementById('btnSolve').disabled = false;
-  document.getElementById('solveHint').textContent = 'Unlock time reached — puzzle ready.';
+  const hint = document.getElementById('solveHint');
+  if (isSolveBusy()) {
+    hint.textContent = CURRENT_SOLVE_STATUS === 'stopping'
+      ? 'Stopping VDF evaluation...'
+      : 'Evaluating VDF...';
+  } else if (CURRENT_PROOF_STATUS === 'running') {
+    hint.textContent = 'Generating proof...';
+  } else if (unlockTarget && new Date() < unlockTarget) {
+    document.getElementById('solveHint').textContent = 'Start solving now to finish near unlock time.';
+  } else {
+    document.getElementById('solveHint').textContent = 'Unlock time reached — decrypt as soon as solve completes.';
+  }
+  syncSolveControls();
 }
 
 function currentAuthQuery() {
@@ -620,10 +653,38 @@ function currentPublicQuery() {
 }
 
 function resetExamSession() {
+  stopPollingProgress();
+  clearInterval(visTimer);
+  visTimer = null;
   CURRENT_EXAM_ID = null;
   CURRENT_ACCESS_TOKEN = null;
   CURRENT_PUZZLE = null;
+  CURRENT_SOLVE_STATUS = 'idle';
+  CURRENT_PROOF_STATUS = 'idle';
   STATE_encrypted = false;
+  document.getElementById('solveHint').textContent = '';
+  document.getElementById('solveSection').classList.add('hidden');
+  document.getElementById('progBar').style.width = '0%';
+  document.getElementById('progPct').textContent = '0%';
+  document.getElementById('sqVis').innerHTML = '<div style="color:var(--muted)">Initialising…</div>';
+
+  document.getElementById('resultCard').classList.add('hidden');
+  document.getElementById('verifyKvs').innerHTML = '';
+  document.getElementById('examWrap').classList.add('hidden');
+  document.getElementById('examOut').textContent = '';
+  document.getElementById('examOut').style.display = 'none';
+  document.getElementById('examImg').src = '';
+  document.getElementById('examImg').style.display = 'none';
+  document.getElementById('btnDownload').classList.add('hidden');
+  document.getElementById('btnDownload').href = `${API}/download`;
+
+  document.getElementById('commitCard').classList.add('hidden');
+  document.getElementById('erasureBanner').classList.add('hidden');
+  document.getElementById('dHExam').textContent = '–';
+  document.getElementById('dHKey').textContent = '–';
+  document.getElementById('dCipher').textContent = '–';
+  [1,2,3,4,5,6].forEach(n => setStep('s'+n, String(n)));
+
   document.getElementById('btnGenerateProof').classList.add('hidden');
   document.getElementById('btnGenerateProof').disabled = true;
   document.getElementById('btnGenerateProof').textContent = '🧮 Generate Proof';
@@ -636,6 +697,7 @@ function resetExamSession() {
   document.getElementById('vdfProofLabel').style.display = 'none';
   document.getElementById('vdfProofBox').style.display = 'none';
   document.getElementById('vdfProofBox').textContent = '';
+  syncSolveControls();
 }
 
 function renderProofState(d) {
@@ -700,6 +762,19 @@ function setStep(id,state) {
 // ── ENCRYPT ──────────────────────────────────────────────
 async function runEncrypt() {
   if (!tSquarings) { alert('Please set an unlock time first.'); return; }
+
+  if (CURRENT_EXAM_ID && CURRENT_ACCESS_TOKEN && isSolveBusy()) {
+    try {
+      await fetch(`${API}/solve/stop`, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ exam_id: CURRENT_EXAM_ID, access_token: CURRENT_ACCESS_TOKEN })
+      });
+    } catch (_) {
+      // Best effort; we still reset UI to avoid stale local state.
+    }
+  }
+
   resetExamSession();
 
   let fetchOpts;
@@ -709,7 +784,7 @@ async function runEncrypt() {
     fetchOpts = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ exam_text: text, t_squarings: tSquarings })
+      body: JSON.stringify({ exam_text: text, t_squarings: tSquarings, demo_mode: DEMO_MODE })
     };
   } else {
     if (!SELECTED_FILE) {
@@ -719,6 +794,7 @@ async function runEncrypt() {
     const fd = new FormData();
     fd.append('file', SELECTED_FILE);
     fd.append('t_squarings', tSquarings);
+    fd.append('demo_mode', DEMO_MODE ? 'true' : 'false');
     fd.append('mime_type', SELECTED_FILE.type || (ACTIVE_TAB === 'pdf' ? 'application/pdf' : 'image/png'));
     fetchOpts = { method: 'POST', body: fd };
   }
@@ -750,8 +826,7 @@ async function runEncrypt() {
     document.getElementById('btnEncrypt').disabled = false;
     document.getElementById('cdBox2').classList.remove('hidden');
     document.getElementById('cdBox2').classList.add('show');
-    if (unlockTarget && new Date() >= unlockTarget) enableSolve();
-    else document.getElementById('solveHint').textContent = 'Solve button enables at unlock time.';
+    enableSolve();
     loadAudit();
   } catch(e) {
     alert('Backend unreachable. Start backend.py first.');
@@ -762,6 +837,7 @@ async function runEncrypt() {
 
 // ── SOLVE ────────────────────────────────────────────────
 function startSqVis(t) {
+  clearInterval(visTimer);
   const vis=document.getElementById('sqVis'); vis.innerHTML=''; let n=0;
   visTimer=setInterval(()=>{
     if(n>9) vis.removeChild(vis.firstChild);
@@ -771,20 +847,43 @@ function startSqVis(t) {
     vis.appendChild(l); n++;
   },100);
 }
-function stopSqVis() {
+function stopSqVis(success = true) {
   clearInterval(visTimer);
+  visTimer = null;
   const vis=document.getElementById('sqVis');
-  if (vis.lastChild && vis.lastChild.textContent === '✔  Key recovered.') return;
+  const finalText = success ? '✔  Key recovered.' : '⏹  VDF evaluation stopped.';
+  if (vis.lastChild && vis.lastChild.textContent === finalText) return;
   const l=document.createElement('div'); l.className='sq-line';
-  l.style.color='var(--green)'; l.textContent='✔  Key recovered.';
+  l.style.color = success ? 'var(--green)' : 'var(--warn)';
+  l.textContent = finalText;
   vis.appendChild(l);
+}
+
+function startPollingProgress() {
+  clearInterval(solveTimer);
+  pollInFlight = false;
+  pollFailures = 0;
+  solveTimer = setInterval(pollProgress, 500);
+  pollProgress();
+}
+
+function stopPollingProgress() {
+  clearInterval(solveTimer);
+  solveTimer = null;
+  pollInFlight = false;
+  pollFailures = 0;
 }
 
 async function runSolve() {
   if (!CURRENT_EXAM_ID || !CURRENT_ACCESS_TOKEN) { alert('Encrypt an exam first.'); return; }
-  document.getElementById('btnSolve').disabled=true;
+  if (CURRENT_PROOF_STATUS === 'running') {
+    alert('Proof generation is running. Wait for it to finish.');
+    return;
+  }
+  CURRENT_SOLVE_STATUS = 'running';
+  syncSolveControls();
   document.getElementById('solveSection').classList.remove('hidden');
-  setPill('solving'); startSqVis(tSquarings||3000);
+  setPill('solving');
   try {
     const r = await fetch(`${API}/solve`,{
       method:'POST',
@@ -792,18 +891,54 @@ async function runSolve() {
       body: JSON.stringify({ exam_id: CURRENT_EXAM_ID, access_token: CURRENT_ACCESS_TOKEN })
     });
     const d = await r.json();
-    if (d.error) throw new Error(d.error);
-    solveTimer=setInterval(pollProgress,300);
+    if (d.error) {
+      if (d.error === 'Already running') {
+        CURRENT_SOLVE_STATUS = 'running';
+        syncSolveControls();
+        document.getElementById('solveHint').textContent = 'Solve is already running. Resuming progress polling...';
+        startSqVis(tSquarings||3000);
+        startPollingProgress();
+        return;
+      }
+      throw new Error(d.error);
+    }
+    CURRENT_SOLVE_STATUS = 'running';
+    syncSolveControls();
+    startSqVis(tSquarings||3000);
+    startPollingProgress();
   } catch(e) {
+    CURRENT_SOLVE_STATUS = 'idle';
     setPill('ready');
-    document.getElementById('btnSolve').disabled = false;
+    syncSolveControls();
     alert(e.message || 'Backend unreachable.');
   }
+}
+
+async function stopSolve() {
+  if (!CURRENT_EXAM_ID || !CURRENT_ACCESS_TOKEN) return;
+  if (!isSolveBusy()) return;
+  CURRENT_SOLVE_STATUS = 'stopping';
+  syncSolveControls();
+  document.getElementById('solveHint').textContent = 'Stopping VDF evaluation...';
+  try {
+    const r = await fetch(`${API}/solve/stop`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ exam_id: CURRENT_EXAM_ID, access_token: CURRENT_ACCESS_TOKEN })
+    });
+    const d = await r.json();
+    if (d.error && d.error !== 'No running solve to stop') throw new Error(d.error);
+  } catch (e) {
+    alert(e.message || 'Could not stop solve.');
+  }
+  startPollingProgress();
 }
 
 async function runGenerateProof() {
   if (!CURRENT_EXAM_ID || !CURRENT_ACCESS_TOKEN) { alert('Solve an exam first.'); return; }
   const btn = document.getElementById('btnGenerateProof');
+  CURRENT_PROOF_STATUS = 'running';
+  syncSolveControls();
   btn.disabled = true;
   btn.textContent = '🧮 Generating Proof...';
   document.getElementById('solveHint').textContent = 'Generating public proof from solved output...';
@@ -815,8 +950,10 @@ async function runGenerateProof() {
     });
     const d = await r.json();
     if (d.error) throw new Error(d.error);
-    solveTimer = setInterval(pollProgress, 300);
+    startPollingProgress();
   } catch (e) {
+    CURRENT_PROOF_STATUS = 'idle';
+    syncSolveControls();
     btn.disabled = false;
     btn.textContent = '🧮 Generate Proof';
     alert(e.message || 'Proof generation failed.');
@@ -824,42 +961,65 @@ async function runGenerateProof() {
 }
 
 async function pollProgress() {
+  if (pollInFlight) return;
+  pollInFlight = true;
   try {
     const r = await fetch(`${API}/progress?${currentAuthQuery()}`);
     const d = await r.json();
     if (d.error) throw new Error(d.error);
+    CURRENT_SOLVE_STATUS = d.status || 'idle';
+    CURRENT_PROOF_STATUS = d.proof_status || 'idle';
+    syncSolveControls();
+    pollFailures = 0;
     const activeProof = d.proof_status === 'running';
     const pct = Math.round(activeProof ? (d.proof_progress || 0) : (d.progress || 0));
     document.getElementById('progBar').style.width = pct + '%';
     document.getElementById('progPct').textContent = pct + '%';
 
     if (d.status === 'running') {
+      setPill('solving');
       document.getElementById('solveHint').textContent = 'Evaluating VDF...';
       return;
     }
 
+    if (d.status === 'stopping') {
+      setPill('solving');
+      document.getElementById('solveHint').textContent = 'Stopping VDF evaluation...';
+      return;
+    }
+
     if (activeProof) {
+      if (d.status === 'done') stopSqVis();
       document.getElementById('solveHint').textContent = 'Generating proof...';
       renderProofState(d);
       return;
     }
 
     if (d.status === 'error') {
-      clearInterval(solveTimer);
+      stopPollingProgress();
       setPill('idle');
       alert(d.error || 'Solve failed.');
       return;
     }
 
+    if (d.status === 'stopped') {
+      stopPollingProgress();
+      stopSqVis(false);
+      setPill('ready');
+      document.getElementById('solveHint').textContent = 'VDF evaluation stopped. Click Evaluate VDF to start again.';
+      renderProofState(d);
+      return;
+    }
+
     if (d.proof_status === 'error') {
-      clearInterval(solveTimer);
+      stopPollingProgress();
       renderProofState(d);
       alert(d.proof_error || 'Proof generation failed.');
       return;
     }
 
     if (d.status === 'done') {
-      clearInterval(solveTimer);
+      stopPollingProgress();
       stopSqVis();
       setPill('done');
       document.getElementById('solveHint').textContent = 'Solved. Generate a proof if you need public verification.';
@@ -868,9 +1028,25 @@ async function pollProgress() {
       loadAudit();
     }
   } catch(e){
-    clearInterval(solveTimer);
+    pollFailures += 1;
+    const msg = (e && e.message) ? e.message : '';
+    const transient = msg.includes('Failed to fetch') || msg.includes('NetworkError');
+    if (transient) {
+      document.getElementById('solveHint').textContent = `Connection hiccup (${pollFailures})... retrying.`;
+      if (pollFailures >= 20) {
+        stopPollingProgress();
+        setPill('idle');
+        syncSolveControls();
+        document.getElementById('solveHint').textContent = 'Connection lost while polling progress. Reconnect to resume updates.';
+        alert('Lost connection to backend while polling progress. Please retry.');
+      }
+      return;
+    }
+    stopPollingProgress();
     setPill('idle');
-    alert(e.message || 'Could not fetch progress.');
+    alert(msg || 'Could not fetch progress.');
+  } finally {
+    pollInFlight = false;
   }
 }
 

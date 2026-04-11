@@ -64,7 +64,7 @@ def section(title: str):
     print(f"\n--- {title} ---")
 
 
-def poll_exam_progress(client, exam_id: str, access_token: str, timeout_s: float = 5.0):
+def poll_exam_status(client, exam_id: str, access_token: str, terminal_statuses: set[str], timeout_s: float = 5.0):
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         resp = client.get(
@@ -72,10 +72,14 @@ def poll_exam_progress(client, exam_id: str, access_token: str, timeout_s: float
             query_string={"exam_id": exam_id, "access_token": access_token},
         )
         data = resp.get_json()
-        if data.get("status") in {"done", "error"}:
+        if data.get("status") in terminal_statuses:
             return resp.status_code, data
         time.sleep(0.05)
     raise TimeoutError(f"Timed out waiting for exam {exam_id}")
+
+
+def poll_exam_progress(client, exam_id: str, access_token: str, timeout_s: float = 5.0):
+    return poll_exam_status(client, exam_id, access_token, {"done", "error"}, timeout_s=timeout_s)
 
 
 def poll_proof_progress(client, exam_id: str, access_token: str, timeout_s: float = 5.0):
@@ -275,6 +279,53 @@ def main():
         check("Solve starts for exam 2", solve2.status_code == 200, failures)
         _, progress2_done = poll_exam_progress(client, enc2["exam_id"], enc2["access_token"])
         check("Exam 2 decrypts its own plaintext", progress2_done["decrypted_text"] == "exam B", failures)
+
+        enc3_resp = client.post(
+            "/api/encrypt",
+            json={"exam_text": "exam C", "t_squarings": 2_000_000, "bits": 256, "scheme": "wesolowski"},
+        )
+        enc3 = enc3_resp.get_json()
+        check("Backend encrypt succeeds for cancellable exam", enc3_resp.status_code == 200 and "exam_id" in enc3, failures)
+        if "exam_id" in enc3:
+            solve3 = client.post(
+                "/api/solve",
+                json={"exam_id": enc3["exam_id"], "access_token": enc3["access_token"]},
+            )
+            check("Solve starts for cancellable exam", solve3.status_code == 200, failures)
+
+            # Wait until solve enters running before issuing stop to avoid racey no-op stops.
+            running_seen = False
+            for _ in range(30):
+                p = client.get(
+                    "/api/progress",
+                    query_string={"exam_id": enc3["exam_id"], "access_token": enc3["access_token"]},
+                ).get_json()
+                if p.get("status") in {"running", "stopping"}:
+                    running_seen = True
+                    break
+                if p.get("status") in {"done", "error", "stopped"}:
+                    break
+                time.sleep(0.01)
+            check("Cancellable solve enters running state", running_seen, failures)
+
+            stop3 = client.post(
+                "/api/solve/stop",
+                json={"exam_id": enc3["exam_id"], "access_token": enc3["access_token"]},
+            )
+            check("Stop request accepted for running solve", stop3.status_code == 200, failures)
+            _, progress3_final = poll_exam_status(
+                client,
+                enc3["exam_id"],
+                enc3["access_token"],
+                {"stopped", "done", "error"},
+                timeout_s=8.0,
+            )
+            check("Solve reaches stopped state after stop request", progress3_final["status"] == "stopped", failures)
+            check(
+                "Stopped solve does not expose decrypted text",
+                not progress3_final.get("decrypted_text"),
+                failures,
+            )
 
         proof_start = client.post(
             "/api/generate_proof",

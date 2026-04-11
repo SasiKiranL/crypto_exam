@@ -64,7 +64,10 @@ app = Flask(__name__)
 EXAMS = {}
 EXAMS_LOCK = threading.Lock()
 DEFAULT_EXAM_VDF_BITS = 1024
+DEMO_EXAM_VDF_BITS = 256
 ENCRYPT_WORKER_TIMEOUT_S = 60
+MAX_ACTIVE_EXAMS = 200
+EXAM_TTL_S = 24 * 3600
 
 # Measured once at startup
 SQUARING_TIME_S = None
@@ -95,7 +98,8 @@ def _request_data():
     if request.method == "GET":
         return request.args
     if request.is_json:
-        return request.get_json(silent=True) or {}
+        payload = request.get_json(silent=True)
+        return payload if isinstance(payload, dict) else {}
     return request.form or {}
 
 
@@ -110,6 +114,56 @@ def _require_pietrzak_t(t: int):
 
 def _make_exam_id() -> str:
     return f"EXAM-{secrets.token_hex(8).upper()}"
+
+
+def _parse_positive_int(raw_value, field_name: str, default: Optional[int] = None) -> int:
+    value = raw_value if raw_value is not None else default
+    if value is None:
+        raise ValueError(f"{field_name} is required")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} must be an integer")
+    if parsed <= 0:
+        raise ValueError(f"{field_name} must be > 0")
+    return parsed
+
+
+def _parse_int_maybe_hex(raw_value, field_name: str) -> int:
+    if raw_value is None:
+        raise ValueError(f"{field_name} is required")
+    if isinstance(raw_value, int):
+        return raw_value
+
+    s = str(raw_value).strip()
+    if not s:
+        raise ValueError(f"{field_name} must be an integer")
+
+    try:
+        s_lower = s.lower()
+        if s_lower.startswith("0x") or s_lower.startswith("-0x") or s_lower.startswith("+0x"):
+            return int(s, 16)
+        if any(ch in "abcdef" for ch in s_lower):
+            return int(s, 16)
+        return int(s, 10)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} must be a valid integer or hex value")
+
+
+def _parse_bool(raw_value, field_name: str, default: bool = False) -> bool:
+    if raw_value is None:
+        return default
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, (int, float)):
+        return bool(raw_value)
+
+    s = str(raw_value).strip().lower()
+    if s in {"1", "true", "yes", "on"}:
+        return True
+    if s in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(f"{field_name} must be a boolean")
 
 
 def _encrypt_exam_worker(raw_bytes: bytes, t: int, bits: int, scheme: str, conn):
@@ -145,13 +199,17 @@ def _encrypt_exam_in_worker(raw_bytes: bytes, t: int, bits: int, scheme: str) ->
     )
     proc.start()
     child_conn.close()
+    result = None
 
     try:
         if not parent_conn.poll(ENCRYPT_WORKER_TIMEOUT_S):
             proc.terminate()
             proc.join(timeout=5)
             raise TimeoutError("Encryption worker timed out")
-        result = parent_conn.recv()
+        try:
+            result = parent_conn.recv()
+        except EOFError:
+            result = {"error": "Encryption worker exited before returning a result"}
     finally:
         parent_conn.close()
         proc.join(timeout=5)
@@ -159,6 +217,10 @@ def _encrypt_exam_in_worker(raw_bytes: bytes, t: int, bits: int, scheme: str) ->
             proc.terminate()
             proc.join(timeout=5)
 
+    if result is None:
+        raise RuntimeError("Encryption worker produced no result")
+    if not isinstance(result, dict):
+        raise RuntimeError("Encryption worker returned malformed result")
     if proc.exitcode not in (0, None) and "error" not in result:
         raise RuntimeError(f"Encryption worker exited with code {proc.exitcode}")
     if "error" in result:
@@ -178,7 +240,11 @@ def _build_exam_record(
     mime_type: str,
     filename: str,
 ):
+    now = time.time()
     return {
+        "lock": threading.Lock(),
+        "created_at_s": now,
+        "last_access_s": now,
         "exam_id": exam_id,
         "access_token": access_token,
         "audit": audit_log,
@@ -191,6 +257,7 @@ def _build_exam_record(
         "filename": filename,
         "solve_progress": 0,
         "solve_status": "idle",
+        "stop_requested": False,
         "solve_error": None,
         "solve_time_s": None,
         "recovered_key_hex": None,
@@ -207,10 +274,42 @@ def _build_exam_record(
     }
 
 
+def _prune_exams_locked(now_s: Optional[float] = None):
+    """Prune expired exams and cap in-memory record count.
+
+    Caller must hold EXAMS_LOCK.
+    """
+    if now_s is None:
+        now_s = time.time()
+
+    # Remove expired exams first.
+    expired = [
+        exam_id
+        for exam_id, exam in EXAMS.items()
+        if now_s - float(exam.get("created_at_s", now_s)) > EXAM_TTL_S
+    ]
+    for exam_id in expired:
+        EXAMS.pop(exam_id, None)
+
+    # Enforce bounded memory by dropping oldest exams.
+    overflow = len(EXAMS) - MAX_ACTIVE_EXAMS
+    if overflow > 0:
+        ordered_ids = sorted(
+            EXAMS,
+            key=lambda exam_id: float(EXAMS[exam_id].get("created_at_s", now_s)),
+        )
+        for exam_id in ordered_ids[:overflow]:
+            EXAMS.pop(exam_id, None)
+
+
 def _get_exam(exam_id: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[Tuple]]:
     if not exam_id:
         return None, (jsonify({"error": "exam_id required"}), 400)
-    exam = EXAMS.get(exam_id)
+    with EXAMS_LOCK:
+        _prune_exams_locked()
+        exam = EXAMS.get(exam_id)
+        if exam:
+            exam["last_access_s"] = time.time()
     if not exam:
         return None, (jsonify({"error": "Unknown exam_id"}), 404)
     return exam, None
@@ -280,15 +379,23 @@ def api_benchmark():
 @app.route("/api/compute-t", methods=["POST"])
 def api_compute_t():
     data = request.json or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "JSON body must be an object"}), 400
     unlock_ts = data.get("unlock_timestamp")
     if not unlock_ts:
         return jsonify({"error": "unlock_timestamp required"}), 400
     if SQUARING_TIME_S is None:
         return jsonify({"error": "Benchmark not ready"}), 503
-    unlock_dt = datetime.fromisoformat(unlock_ts.replace("Z", "+00:00"))
+    try:
+        unlock_dt = datetime.fromisoformat(str(unlock_ts).replace("Z", "+00:00"))
+    except ValueError:
+        return jsonify({"error": "unlock_timestamp must be ISO-8601 format"}), 400
     if unlock_dt.tzinfo is None:
         unlock_dt = unlock_dt.replace(tzinfo=timezone.utc)
-    demo_mode = bool(data.get("demo_mode", False))
+    try:
+        demo_mode = _parse_bool(data.get("demo_mode", False), "demo_mode", default=False)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     gap_s = (unlock_dt - datetime.now(timezone.utc)).total_seconds()
     if gap_s <= 0:
         return jsonify({"error": "Unlock time must be in the future"}), 400
@@ -410,22 +517,38 @@ def api_encrypt():
         raw_bytes = file_obj.read()
         mime_type = request.form.get("mime_type") or file_obj.mimetype or "application/octet-stream"
         filename  = file_obj.filename or "exam_file"
-        t         = int(request.form.get("t_squarings", 3000))
-        bits      = int(request.form.get("bits", DEFAULT_EXAM_VDF_BITS))
+        try:
+            demo_mode = _parse_bool(request.form.get("demo_mode"), "demo_mode", default=False)
+            bits_raw = request.form.get("bits")
+            bits_default = DEMO_EXAM_VDF_BITS if (demo_mode and bits_raw is None) else DEFAULT_EXAM_VDF_BITS
+            t = _parse_positive_int(request.form.get("t_squarings"), "t_squarings", default=3000)
+            bits = _parse_positive_int(bits_raw, "bits", default=bits_default)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         scheme    = request.form.get("scheme", "wesolowski")
         # Label used when displaying file size etc.
         content_label = f"{filename} ({len(raw_bytes):,} bytes)"
     else:
         # Plain-text JSON path (backward-compatible)
         data      = request.json or {}
+        if not isinstance(data, dict):
+            return jsonify({"error": "JSON body must be an object"}), 400
         text      = data.get("exam_text", "")
+        if not isinstance(text, str):
+            return jsonify({"error": "exam_text must be a string"}), 400
         if not text:
             return jsonify({"error": "exam_text required"}), 400
         raw_bytes = text.encode("utf-8")
         mime_type = "text/plain"
         filename  = "exam.txt"
-        t         = int(data.get("t_squarings", 3000))
-        bits      = int(data.get("bits", DEFAULT_EXAM_VDF_BITS))
+        try:
+            demo_mode = _parse_bool(data.get("demo_mode"), "demo_mode", default=False)
+            bits_raw = data.get("bits")
+            bits_default = DEMO_EXAM_VDF_BITS if (demo_mode and bits_raw is None) else DEFAULT_EXAM_VDF_BITS
+            t = _parse_positive_int(data.get("t_squarings"), "t_squarings", default=3000)
+            bits = _parse_positive_int(bits_raw, "bits", default=bits_default)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         scheme    = data.get("scheme", "wesolowski")
         content_label = f"{len(raw_bytes):,} bytes"
 
@@ -479,7 +602,9 @@ def api_encrypt():
         filename=filename,
     )
     with EXAMS_LOCK:
+        _prune_exams_locked()
         EXAMS[exam_id] = exam_record
+        _prune_exams_locked()
     return jsonify({
         "exam_id": exam_id, "H_exam": H_exam, "H_key": H_key,
         "access_token": access_token,
@@ -506,66 +631,127 @@ def api_solve():
         return error
     if exam is None:
         return jsonify({"error": "Exam not found"}), 404
-    if not exam.get("puzzle"):
-        return jsonify({"error": "No active exam"}), 400
-    if exam.get("solve_status") == "running":
-        return jsonify({"error": "Already running"}), 400
-    exam["solve_status"] = "running"
-    exam["solve_progress"] = 0
-    exam["solve_error"] = None
-    exam["proof_status"] = "idle"
-    exam["proof_progress"] = 0
-    exam["proof_error"] = None
-    exam["vdf_proof"] = []
+    lock = exam["lock"]
+    with lock:
+        if not exam.get("puzzle"):
+            return jsonify({"error": "No active exam"}), 400
+        if exam.get("solve_status") in {"running", "stopping"}:
+            return jsonify({"error": "Already running"}), 400
+        if exam.get("proof_status") == "running":
+            return jsonify({"error": "Proof generation is running; wait for it to finish"}), 400
+        exam["solve_status"] = "running"
+        exam["stop_requested"] = False
+        exam["solve_progress"] = 0
+        exam["solve_error"] = None
+        exam["solve_time_s"] = None
+        exam["proof_status"] = "idle"
+        exam["proof_progress"] = 0
+        exam["proof_error"] = None
+        exam["vdf_proof"] = []
+        # Flush stale outputs from previous solve runs.
+        exam["recovered_key_hex"] = None
+        exam["decrypted_text"] = None
+        exam["decrypted_b64"] = None
+        exam["key_verified"] = None
+        exam["exam_verified"] = None
+        exam["y_hex"] = None
 
     def run():
         t0 = time.perf_counter()
         try:
-            puzzle = exam["puzzle"]
+            with lock:
+                puzzle = dict(exam["puzzle"])
+                h_key = exam["H_key"]
+                h_exam = exam["H_exam"]
+                nonce_hex = exam["nonce_hex"]
+                ciphertext_hex = exam["ciphertext_hex"]
+                mime = exam.get("mime_type", "text/plain")
+
             N = int(puzzle["N"], 16)
             g = int(puzzle["g"], 16)
             t = puzzle["t"]
             locked_key = bytes.fromhex(puzzle["locked_key"])
-            scheme = puzzle.get("scheme", "wesolowski")
+
+            def on_progress(pct: int):
+                with lock:
+                    exam["solve_progress"] = pct
+
+            def should_stop() -> bool:
+                with lock:
+                    return bool(exam.get("stop_requested"))
 
             y, mask = sequential_squaring_eval(
                 N, g, t,
-                progress_cb=lambda p: exam.update({"solve_progress": p}),
+                progress_cb=on_progress,
+                stop_cb=should_stop,
             )
             recovered = bytes(a ^ b for a, b in zip(locked_key, mask[: len(locked_key)]))
-            key_ok = hashlib.sha256(recovered).hexdigest() == exam["H_key"]
-            exam["key_verified"] = key_ok
-            exam["recovered_key_hex"] = recovered.hex()[:32] + "…"
+            key_ok = hashlib.sha256(recovered).hexdigest() == h_key
 
-            # Exam recovery needs y for the published commitment but skips proof
-            # generation because proof construction dominates runtime for large t.
-            exam["vdf_proof"] = []
-            exam["y_hex"] = hex(y)
+            decrypted_text = None
+            decrypted_b64 = None
+            exam_verified = None
 
             if key_ok:
                 pt = aes_decrypt(
-                    bytes.fromhex(exam["nonce_hex"]),
-                    bytes.fromhex(exam["ciphertext_hex"]),
+                    bytes.fromhex(nonce_hex),
+                    bytes.fromhex(ciphertext_hex),
                     recovered,
                 )
-                exam["exam_verified"] = hashlib.sha256(pt).hexdigest() == exam["H_exam"]
-                mime = exam.get("mime_type", "text/plain")
+                exam_verified = hashlib.sha256(pt).hexdigest() == h_exam
                 if mime == "text/plain":
-                    exam["decrypted_text"] = pt.decode(errors="replace")
-                    exam["decrypted_b64"] = None
+                    decrypted_text = pt.decode(errors="replace")
                 else:
                     # Binary: store as base64 so frontend can download/preview
-                    exam["decrypted_text"] = None
-                    exam["decrypted_b64"] = base64.b64encode(pt).decode()
-            exam["solve_time_s"] = round(time.perf_counter() - t0, 3)
-            exam["solve_status"] = "done"
+                    decrypted_b64 = base64.b64encode(pt).decode()
+
+            # Exam recovery needs y for the published commitment but skips proof
+            # generation because proof construction dominates runtime for large t.
+            with lock:
+                exam["key_verified"] = key_ok
+                exam["recovered_key_hex"] = recovered.hex()[:32] + "…"
+                exam["vdf_proof"] = []
+                exam["y_hex"] = hex(y)
+                exam["exam_verified"] = exam_verified
+                exam["decrypted_text"] = decrypted_text
+                exam["decrypted_b64"] = decrypted_b64
+                exam["solve_time_s"] = round(time.perf_counter() - t0, 3)
+                exam["solve_status"] = "done"
+                exam["stop_requested"] = False
         except Exception as e:
-            traceback.print_exc()
-            exam["solve_status"] = "error"
-            exam["solve_error"] = str(e)
+            with lock:
+                if str(e) == "Solve stopped by user":
+                    exam["solve_status"] = "stopped"
+                    exam["solve_error"] = None
+                    exam["solve_time_s"] = round(time.perf_counter() - t0, 3)
+                else:
+                    traceback.print_exc()
+                    exam["solve_status"] = "error"
+                    exam["solve_error"] = str(e)
+                exam["stop_requested"] = False
 
     threading.Thread(target=run, daemon=True).start()
     return jsonify({"status": "started", "exam_id": exam_id})
+
+
+@app.route("/api/solve/stop", methods=["POST"])
+def api_solve_stop():
+    """Request cancellation of an in-progress solve operation."""
+    exam_id, exam, error = _require_exam_access()
+    if error:
+        return error
+    if exam is None:
+        return jsonify({"error": "Exam not found"}), 404
+
+    lock = exam["lock"]
+    with lock:
+        status = exam.get("solve_status")
+        if status not in {"running", "stopping"}:
+            return jsonify({"error": "No running solve to stop"}), 400
+        exam["stop_requested"] = True
+        exam["solve_status"] = "stopping"
+
+    return jsonify({"status": "stopping", "exam_id": exam_id})
 
 
 @app.route("/api/download", methods=["GET"])
@@ -576,14 +762,17 @@ def api_download():
         return error
     if exam is None:
         return jsonify({"error": "Exam not found"}), 404
-    if exam.get("solve_status") != "done":
+    lock = exam["lock"]
+    with lock:
+        status = exam.get("solve_status")
+        b64 = exam.get("decrypted_b64")
+        mime = exam.get("mime_type", "application/octet-stream")
+        fname = exam.get("filename", "decrypted_exam")
+    if status != "done":
         return jsonify({"error": "Not ready"}), 400
-    b64 = exam.get("decrypted_b64")
     if not b64:
         return jsonify({"error": "No binary file to download (text-only exam)"}), 400
     data = base64.b64decode(b64)
-    mime = exam.get("mime_type", "application/octet-stream")
-    fname = exam.get("filename", "decrypted_exam")
     return send_file(
         io.BytesIO(data),
         mimetype=mime,
@@ -602,43 +791,55 @@ def api_generate_proof():
         return error
     if exam is None:
         return jsonify({"error": "Exam not found"}), 404
-    if exam.get("solve_status") != "done" or not exam.get("y_hex"):
-        return jsonify({"error": "Solve the exam first"}), 400
-    if exam.get("proof_status") == "running":
-        return jsonify({"error": "Proof generation already running"}), 400
-    if exam.get("vdf_proof"):
-        return jsonify({"status": "already_generated", "exam_id": exam_id}), 200
+    lock = exam["lock"]
+    with lock:
+        if exam.get("solve_status") != "done" or not exam.get("y_hex"):
+            return jsonify({"error": "Solve the exam first"}), 400
+        if exam.get("proof_status") == "running":
+            return jsonify({"error": "Proof generation already running"}), 400
+        if exam.get("vdf_proof"):
+            return jsonify({"status": "already_generated", "exam_id": exam_id}), 200
 
-    exam["proof_status"] = "running"
-    exam["proof_progress"] = 0
-    exam["proof_error"] = None
+        exam["proof_status"] = "running"
+        exam["proof_progress"] = 0
+        exam["proof_error"] = None
 
     def run():
         try:
-            puzzle = exam["puzzle"]
+            with lock:
+                puzzle = dict(exam["puzzle"])
+                y_hex = exam["y_hex"]
             N = int(puzzle["N"], 16)
             g = int(puzzle["g"], 16)
-            y = int(exam["y_hex"], 16)
+            y = int(y_hex, 16)
             t = puzzle["t"]
             scheme = puzzle.get("scheme", "wesolowski")
+
+            def on_proof_progress(pct: int):
+                with lock:
+                    exam["proof_progress"] = pct
 
             pi = generate_vdf_proof(
                 N, g, y, t,
                 scheme=scheme,
-                progress_cb=lambda p: exam.update({"proof_progress": p}),
+                progress_cb=on_proof_progress,
             )
 
             if scheme == "wesolowski":
                 assert isinstance(pi, int)
-                exam["vdf_proof"] = [{"pi": hex(pi)}]
+                vdf_proof = [{"pi": hex(pi)}]
             else:
                 assert isinstance(pi, list)
-                exam["vdf_proof"] = [{"mu": hex(mu), "t": tl} for mu, tl in pi]
-            exam["proof_status"] = "done"
-            exam["proof_progress"] = 100
+                vdf_proof = [{"mu": hex(mu), "t": tl} for mu, tl in pi]
+
+            with lock:
+                exam["vdf_proof"] = vdf_proof
+                exam["proof_status"] = "done"
+                exam["proof_progress"] = 100
         except Exception as exc:
-            exam["proof_status"] = "error"
-            exam["proof_error"] = str(exc)
+            with lock:
+                exam["proof_status"] = "error"
+                exam["proof_error"] = str(exc)
 
     threading.Thread(target=run, daemon=True).start()
     return jsonify({"status": "started", "exam_id": exam_id})
@@ -652,6 +853,9 @@ def api_verify_vdf():
     """
     data: Dict[str, Any] = request.json or {}
     try:
+        if not isinstance(data, dict):
+            return jsonify({"error": "JSON body must be an object"}), 400
+
         N_val = data.get("N")
         g_val = data.get("g")
         y_val = data.get("y")
@@ -660,10 +864,10 @@ def api_verify_vdf():
         if N_val is None or g_val is None or y_val is None or t_val is None:
             return jsonify({"error": "N, g, y, t are required"}), 400
         
-        N = int(str(N_val), 16)
-        g = int(str(g_val), 16)
-        y = int(str(y_val), 16)
-        t = int(str(t_val))
+        N = _parse_int_maybe_hex(N_val, "N")
+        g = _parse_int_maybe_hex(g_val, "g")
+        y = _parse_int_maybe_hex(y_val, "y")
+        t = _parse_positive_int(t_val, "t")
         
         scheme = data.get("scheme", "wesolowski")
         pi_raw = data.get("pi")
@@ -671,14 +875,27 @@ def api_verify_vdf():
         if scheme == "wesolowski":
             if pi_raw is None:
                 return jsonify({"error": "pi is required for wesolowski scheme"}), 400
-            if isinstance(pi_raw, list) and pi_raw and isinstance(pi_raw[0], dict) and "pi" in pi_raw[0]:
-                pi = int(pi_raw[0]["pi"], 16)
-            else:
-                pi = int(str(pi_raw), 16)
+            try:
+                if isinstance(pi_raw, list) and pi_raw and isinstance(pi_raw[0], dict):
+                    if "pi" not in pi_raw[0]:
+                        return jsonify({"error": "wesolowski proof object must contain 'pi'"}), 400
+                    pi = _parse_int_maybe_hex(pi_raw[0]["pi"], "pi")
+                else:
+                    pi = _parse_int_maybe_hex(pi_raw, "pi")
+            except (TypeError, ValueError):
+                return jsonify({"error": "Invalid wesolowski proof format"}), 400
         elif scheme == "pietrzak":
-            if not isinstance(pi_raw, list) or pi_raw is None:
+            if pi_raw is None or not isinstance(pi_raw, list):
                 return jsonify({"error": "pi must be a list for pietrzak scheme"}), 400
-            pi = [(int(e["mu"], 16), int(e["t"])) for e in pi_raw]
+            normalized_pi = []
+            for idx, entry in enumerate(pi_raw):
+                if not isinstance(entry, dict) or "mu" not in entry or "t" not in entry:
+                    return jsonify({"error": f"Invalid pietrzak proof entry at index {idx}"}), 400
+                try:
+                    normalized_pi.append((_parse_int_maybe_hex(entry["mu"], "mu"), _parse_positive_int(entry["t"], "t")))
+                except (TypeError, ValueError):
+                    return jsonify({"error": f"Invalid pietrzak proof values at index {idx}"}), 400
+            pi = normalized_pi
         else:
             return jsonify({"error": f"Unknown scheme: {scheme}"}), 400
 
@@ -1267,25 +1484,28 @@ def api_progress():
         return error
     if exam is None:
         return jsonify({"error": "Exam not found"}), 404
-    return jsonify({
-        "progress": exam.get("solve_progress", 0),
-        "status": exam.get("solve_status", "idle"),
-        "error": exam.get("solve_error"),
-        "key_verified": exam.get("key_verified"),
-        "exam_verified": exam.get("exam_verified"),
-        "recovered_key_hex": exam.get("recovered_key_hex"),
-        "decrypted_text": exam.get("decrypted_text"),
-        "decrypted_b64": exam.get("decrypted_b64"),
-        "mime_type": exam.get("mime_type", "text/plain"),
-        "filename": exam.get("filename", "exam.txt"),
-        "solve_time_s": exam.get("solve_time_s"),
-        "vdf_proof": exam.get("vdf_proof"),
-        "y_hex": exam.get("y_hex"),
-        "proof_status": exam.get("proof_status", "idle"),
-        "proof_progress": exam.get("proof_progress", 0),
-        "proof_error": exam.get("proof_error"),
-        "scheme": exam.get("scheme"),
-    })
+    lock = exam["lock"]
+    with lock:
+        payload = {
+            "progress": exam.get("solve_progress", 0),
+            "status": exam.get("solve_status", "idle"),
+            "error": exam.get("solve_error"),
+            "key_verified": exam.get("key_verified"),
+            "exam_verified": exam.get("exam_verified"),
+            "recovered_key_hex": exam.get("recovered_key_hex"),
+            "decrypted_text": exam.get("decrypted_text"),
+            "decrypted_b64": exam.get("decrypted_b64"),
+            "mime_type": exam.get("mime_type", "text/plain"),
+            "filename": exam.get("filename", "exam.txt"),
+            "solve_time_s": exam.get("solve_time_s"),
+            "vdf_proof": list(exam.get("vdf_proof") or []),
+            "y_hex": exam.get("y_hex"),
+            "proof_status": exam.get("proof_status", "idle"),
+            "proof_progress": exam.get("proof_progress", 0),
+            "proof_error": exam.get("proof_error"),
+            "scheme": exam.get("scheme"),
+        }
+    return jsonify(payload)
 
 
 
@@ -1324,4 +1544,4 @@ if __name__ == "__main__":
     print("    POST /api/replication/encode  POST /api/replication/verify")
     print("    POST /api/encrypt  POST /api/solve  POST /api/generate_proof  POST /api/verify_vdf")
     print()
-    app.run(debug=False, port=5050)
+    app.run(debug=False, port=5050, threaded=True)

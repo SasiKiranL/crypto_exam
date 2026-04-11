@@ -48,7 +48,7 @@ def aes_decrypt(nonce: bytes, ct: bytes, key: bytes) -> bytes:
     return AESGCM(key).decrypt(nonce, ct, None)
 
 
-def sequential_squaring_eval(N: int, g: int, t: int, progress_cb=None) -> tuple[int, bytes]:
+def sequential_squaring_eval(N: int, g: int, t: int, progress_cb=None, stop_cb=None) -> tuple[int, bytes]:
     """
     Compute y = g^(2^t) mod N by repeated squaring only.
 
@@ -59,6 +59,8 @@ def sequential_squaring_eval(N: int, g: int, t: int, progress_cb=None) -> tuple[
     report = max(1, t // 100) if t > 100 else 1
     cur = g
     for i in range(t):
+        if stop_cb and stop_cb():
+            raise RuntimeError("Solve stopped by user")
         cur = (cur * cur) % N
         if progress_cb and i % report == 0:
             progress_cb(int(100 * i / t))
@@ -90,14 +92,19 @@ def hash_to_prime(x_bytes: bytes, bits: int = 128) -> int:
         counter += 1
 
 
+def _fs_encode_parts(*parts: int) -> bytes:
+    """Length-prefix integer parts to avoid ambiguous concatenation."""
+    out = bytearray()
+    for part in parts:
+        b = str(part).encode()
+        out.extend(len(b).to_bytes(4, "big"))
+        out.extend(b)
+    return bytes(out)
+
+
 def _fiat_shamir_challenge(N: int, x: int, y: int, mu: int, bits: int = 128) -> int:
     """Pietrzak Fiat-Shamir challenge prime."""
-    data = (
-        str(N).encode()
-        + str(x).encode()
-        + str(y).encode()
-        + str(mu).encode()
-    )
+    data = b"pietrzak|" + _fs_encode_parts(N, x, y, mu)
     return hash_to_prime(data, bits=bits)
 
 
@@ -106,7 +113,7 @@ def _wesolowski_challenge(N: int, g: int, y: int, t: int, bits: int = 128) -> in
     Wesolowski Fiat-Shamir challenge prime ℓ (§5).
     Challenge depends on (N, g, y, t) to bind all statement parameters.
     """
-    data = str(N).encode() + str(g).encode() + str(y).encode() + str(t).encode()
+    data = b"wesolowski|" + _fs_encode_parts(N, g, y, t)
     return hash_to_prime(data, bits=bits)
 
 
